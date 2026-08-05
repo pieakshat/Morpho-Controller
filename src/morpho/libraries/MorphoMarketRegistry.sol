@@ -6,11 +6,10 @@ import {MorphoMarketConfig} from "../types/MorphoTypes.sol";
 
 /// @notice Owner-managed whitelist of Morpho markets this adapter may hold positions in,
 ///         plus tracking of which markets currently have a non-zero position.
-/// @dev Two separate lists, two separate jobs:
-///      - the whitelist bounds blast radius if the allocator key is ever compromised
-///      - the active set exists purely for gas: totalAssets() should iterate only markets
-///        with real exposure, not the entire whitelist every single call.
-///      Meant to be inherited by MorphoAdapter, not deployed standalone.
+/// @dev The whitelist bounds blast radius if the allocator key is ever compromised. The
+///      active set is tracked separately so totalAssets() only has to iterate markets with
+///      real exposure, which can be a small fraction of the whitelist. Meant to be inherited
+///      by a concrete vault (see MorphoLeverageVault) rather than deployed on its own.
 abstract contract MorphoMarketRegistry {
     error MarketAlreadyRegistered(Id id);
     error MarketNotRegistered(Id id);

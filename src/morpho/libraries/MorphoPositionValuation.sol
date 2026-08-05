@@ -9,8 +9,8 @@ import {MorphoCore} from "./MorphoCore.sol";
 import {MorphoMarketRegistry} from "./MorphoMarketRegistry.sol";
 
 /// @notice Reads live Morpho state and values this adapter's positions in ASSET terms.
-/// @dev Only iterates the registry's active set, not the whole whitelist — the active set
-///      exists precisely so this stays cheap regardless of how many markets are whitelisted.
+/// @dev Iterates only the registry's active set. That set exists precisely so this stays
+///      cheap regardless of how many markets are whitelisted in total.
 abstract contract MorphoPositionValuation is MorphoCore, MorphoMarketRegistry {
     /// @notice Net value (collateral value minus debt) of one market's position, in ASSET
     ///         terms. Zero if this market currently has no position at all.
@@ -42,7 +42,8 @@ abstract contract MorphoPositionValuation is MorphoCore, MorphoMarketRegistry {
     }
 
     /// @notice Sum of every currently active market's net position value, in ASSET terms.
-    /// @dev This is the piece IAdapter.totalAssets() will call once MorphoAdapter exists.
+    /// @dev Called by MorphoLeverageVault.totalAssets() to fold live Morpho exposure into
+    ///      the vault's share price, alongside idle balance.
     function totalMorphoAssets() public view returns (uint256 total) {
         uint256 length = _activeMarkets.length;
         for (uint256 i = 0; i < length; ++i) {

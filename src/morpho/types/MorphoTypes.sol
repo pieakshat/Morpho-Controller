@@ -10,17 +10,17 @@ struct MorphoMarketConfig {
     /// @dev The real Morpho market this config describes. Its Id is derivable from this —
     ///      keccak256(abi.encode(params)) — we don't store the Id redundantly.
     MarketParams params;
-    /// @notice 1e18 = plain seeding (no debt). Anything above 1e18 = leveraged via flashloan looping.
+    /// @notice 1e18 = no leverage (plain seeding, no debt). Values above 1e18 open a
+    ///         leveraged position on increase.
+    /// @dev Leverage is achieved via flashloan-based looping — see MorphoLeverageEngine.
     uint256 targetLeverage;
-    /// @notice The whitelist gate. Allocator can only act on a market where this is true —
-    ///         bounds blast radius if the allocator key is ever compromised.
+    /// @notice The whitelist gate — the allocator can only act on a market where this is true.
     bool enabled;
 }
 
 /// @notice One instruction within a rebalance call, touching exactly one market.
-/// @dev Flat and typed on purpose — we don't have Blend's cross-contract opacity constraint
-///      (their StrategyManager doesn't know what their SwapAdapter needs; ours is one
-///      self-contained system), so there's no reason to nest abi.encode calls inside bytes.
+/// @dev Flat and typed on purpose — this is one self-contained system, so there's no
+///      reason to nest abi.encode calls inside opaque bytes just to cross a module boundary.
 struct MarketAction {
     /// @notice Must match an enabled MorphoMarketConfig's computed Id.
     Id marketId;

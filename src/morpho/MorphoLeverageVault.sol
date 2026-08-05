@@ -22,10 +22,8 @@ import {MorphoSwapExecutor} from "./libraries/MorphoSwapExecutor.sol";
 
 /// @notice Standalone ERC-4626 vault that directly manages leveraged positions across
 ///         multiple Morpho markets, driven by an off-chain engine submitting MarketAction[].
-/// @dev Deliberately independent of AggVault/IAdapter — this vault IS the position holder,
-///      not something plugged into another vault. Composable with AggVault later for free:
-///      its existing ERC4626Adapter can wrap any standards-compliant ERC4626 vault with
-///      zero new code, as long as this one behaves correctly as one.
+/// @dev Positions are held directly by this contract; there's no separate position-holding
+///      module underneath it.
 contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPositionValuation, MorphoLeverageEngine {
     error NotAllocator();
 
@@ -33,9 +31,8 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
 
     mapping(address => bool) private _isAllocator;
 
-    /// @dev Owner always has allocator rights too — same convention as AggVault's own
-    ///      onlyAllocator, kept consistent across the two codebases even though this
-    ///      vault doesn't inherit AggVault's actual access-control code.
+    /// @dev Owner always has allocator rights too — the allocator role narrows day-to-day
+    ///      operational access without ever locking the owner out of their own vault.
     modifier onlyAllocator() {
         if (msg.sender != owner() && !_isAllocator[msg.sender]) revert NotAllocator();
         _;
@@ -61,21 +58,24 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     //////////////////////////////////////////////////////////////*/
 
     /// @dev The full picture: idle balance plus every active Morpho position's net value.
-    ///      Drives share pricing — this must be honest, unlike maxWithdrawable below which
-    ///      is deliberately conservative.
+    ///      Drives share pricing — this must be honest, unlike maxWithdraw below which is
+    ///      deliberately conservative.
     function totalAssets() public view override returns (uint256) {
         return IERC20(asset()).balanceOf(address(this)) + totalMorphoAssets();
     }
 
+    /// @dev OZ's virtual-offset inflation mitigation, inflating share precision by 10**3
+    ///      relative to the asset — makes a first-depositor donation attack impractically
+    ///      expensive.
     function _decimalsOffset() internal pure override returns (uint8) {
         return 3;
     }
 
-    /// @dev Deliberately reports ONLY idle balance, not total position value. Unwinding a
-    ///      leveraged position needs swap-route data only the off-chain engine can supply —
-    ///      a plain synchronous withdraw() can't do that. This clamp is what keeps AggVault-
-    ///      style "don't promise more liquidity than is synchronously available" honest;
-    ///      the off-chain engine is responsible for keeping enough idle buffer around.
+    /// @dev Reports only idle balance, not total position value. Unwinding a leveraged
+    ///      position needs swap-route data that only the off-chain engine can supply, so a
+    ///      synchronous withdraw() has no way to source it. This clamp keeps the vault from
+    ///      promising more liquidity than is actually available on demand; the off-chain
+    ///      engine is responsible for keeping enough idle buffer around.
     function maxWithdraw(address owner_) public view override returns (uint256) {
         uint256 ownerAssets = super.maxWithdraw(owner_);
         uint256 idle = IERC20(asset()).balanceOf(address(this));
@@ -109,8 +109,8 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Deploys idle capital into markets, unwinds positions back to idle capital,
-    ///         or both in one call — a genuine rebalance, decrease on one market feeding
-    ///         an increase on another, same transaction.
+    ///         or both in the same call — a decrease on one market can fund an increase on
+    ///         another within a single transaction.
     function executeActions(MarketAction[] calldata actions) external onlyAllocator nonReentrant {
         uint256 length = actions.length;
         for (uint256 i = 0; i < length; ++i) {
@@ -127,23 +127,28 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
                                 REGISTRY ADMIN
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Adds `params` to the market whitelist at the given target leverage.
     function registerMarket(MarketParams calldata params, uint256 targetLeverage) external onlyOwner returns (Id) {
         return _registerMarket(params, targetLeverage);
     }
 
+    /// @notice Enables or disables new increases into an already-registered market.
     function setMarketEnabled(Id id, bool enabled) external onlyOwner {
         _setMarketEnabled(id, enabled);
     }
 
+    /// @notice Updates the target leverage used by future increases into a market.
     function setMarketLeverage(Id id, uint256 targetLeverage) external onlyOwner {
         _setMarketLeverage(id, targetLeverage);
     }
 
+    /// @notice Grants or revokes allocator rights (the ability to call executeActions).
     function setAllocator(address account, bool allowed) external onlyOwner {
         _isAllocator[account] = allowed;
         emit AllocatorUpdated(account, allowed);
     }
 
+    /// @notice Returns whether `account` currently holds allocator rights.
     function isAllocator(address account) external view returns (bool) {
         return _isAllocator[account];
     }

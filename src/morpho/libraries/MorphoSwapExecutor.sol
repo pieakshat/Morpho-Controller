@@ -8,8 +8,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /// @dev This is the piece that makes accepting arbitrary {target, callData} in a
 ///      MarketAction survivable — without it, minOut would just be a number nobody
 ///      checks. Expects tokenIn to already be sitting in this contract's own balance,
-///      transferred in by a prior Bundler3 step (mirrors Blend's SwapAdapter pattern:
-///      a Call transfers tokens in, a separate Call executes the swap).
+///      transferred in by a prior Bundler3 step: one Call moves tokens in, a separate
+///      Call executes the swap.
 contract MorphoSwapExecutor {
     using SafeERC20 for IERC20;
 
@@ -19,11 +19,9 @@ contract MorphoSwapExecutor {
     /// @notice Swaps this contract's entire current balance of `tokenIn` through
     ///         `target` using `data`, then sends the resulting `tokenOut` to `recipient`.
     /// @dev `minOut` is trusted from whoever constructs the MarketAction (the allocator) —
-    ///      this is a flat floor, not an oracle-independent check like Blend's SwapAdapter.
-    ///      That's a deliberate simplification, not an oversight: it means the allocator
-    ///      role is trusted not to collude with itself (set minOut low, then swap through
-    ///      a bad venue). Worth revisiting if the allocator key is ever less trusted than
-    ///      "operator of this system" — at that point an oracle-derived floor is the fix.
+    ///      a flat floor, not an oracle-derived check. This assumes the allocator won't
+    ///      collude with itself (set minOut low, then swap through a bad venue); revisit
+    ///      with an oracle-derived floor if that trust assumption ever changes.
     function executeSwap(
         IERC20 tokenIn,
         IERC20 tokenOut,
