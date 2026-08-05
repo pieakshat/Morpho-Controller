@@ -23,6 +23,27 @@ $ forge build
 
 ### Test
 
+Unit tests (`test/unit/`) are pure Solidity — math, registry, and swap-executor behavior
+against local mocks. No network access, safe to run anytime:
+
+```shell
+$ forge test --match-path 'test/unit/*'
+```
+
+Fork tests (`test/fork/`) exercise the leverage engine's actual flashloan mechanics against
+real, deployed Morpho Blue / Bundler3 / GeneralAdapter1 contracts on Arbitrum — only the
+swap venue is mocked. They require an **archive-capable** RPC endpoint in `ARBITRUM_RPC_URL`
+(see `.env.example`); the public `arb1.arbitrum.io` endpoint only retains ~30 minutes of
+state and cannot serve the pinned block these tests fork from. They fail loudly (not
+silently skip) if `ARBITRUM_RPC_URL` is unset:
+
+```shell
+$ cp .env.example .env   # fill in an archive RPC URL (Alchemy/Infura/QuickNode)
+$ forge test --match-path 'test/fork/*'
+```
+
+Full suite:
+
 ```shell
 $ forge test
 ```
