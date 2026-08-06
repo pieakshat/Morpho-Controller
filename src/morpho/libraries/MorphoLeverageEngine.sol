@@ -5,6 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Id, MarketParams} from "../interfaces/IMorpho.sol";
 import {Call} from "../interfaces/IBundler3.sol";
+import {IOracle} from "../interfaces/IOracle.sol";
 import {MorphoMarketConfig, MarketAction} from "../types/MorphoTypes.sol";
 import {MorphoSharesMath} from "./MorphoSharesMath.sol";
 import {MorphoSwapExecutor} from "./MorphoSwapExecutor.sol";
@@ -20,6 +21,8 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     error LeverageBelowOneX(uint256 requested);
     error LeverageExceedsMax(uint256 requested, uint256 max);
     error InvalidDecreaseAmount(uint256 requested, uint256 available);
+    error TargetLeverageNotBelowCurrent(uint256 target, uint256 current);
+    error DeleverageAmountTooSmall();
 
     /// @dev Groups _decreasePosition's derived numbers into one struct, passed by memory
     ///      reference between the planning and bundle-building helpers below.
@@ -118,23 +121,35 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                                   DECREASE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Reduces or fully closes a leveraged position.
-    /// @dev `action.amount` is collateral to withdraw, or type(uint256).max for a full
-    ///      close. A full close repays by exact shares instead of a rounded asset
-    ///      estimate, to avoid dust.
+    /// @notice Reduces or fully closes a leveraged position, or brings it down to a lower
+    ///         leverage in place.
+    /// @dev Two mutually exclusive modes, selected by `action.leverage`:
+    ///      - `action.leverage == 0`: `action.amount` is collateral to withdraw, or
+    ///        type(uint256).max for a full close. A full close repays by exact shares
+    ///        instead of a rounded asset estimate, to avoid dust.
+    ///      - `action.leverage > 0`: deleverage to that target ratio. `action.amount` is
+    ///        ignored. Collateral is unwound and swapped, and the proceeds repay exactly
+    ///        enough debt to land the position at the target, holding equity constant —
+    ///        this is self-funded, no capital comes from or returns to idle balance beyond
+    ///        whatever the swap delivers above `action.minOut`. Never fully closes the
+    ///        position: a target of exactly 1e18 pays off all debt but leaves collateral.
     ///
     ///      When there's debt, swap proceeds land on GeneralAdapter1 rather than this
     ///      adapter, because Morpho's flashLoan() reclaims its due amount synchronously
     ///      before any later bundle step runs — the repayment funds must already be
     ///      sitting there. Whatever's left after repayment is swept back here as the
     ///      remaining balance (type(uint256).max), since swap slippage means the exact
-    ///      leftover amount can't be known in advance.
+    ///      leftover amount can't be known in advance. For a deleverage, `action.minOut`
+    ///      is the floor on that same swap: set it below the computed repay amount and a
+    ///      bad fill reverts cleanly in the swap executor instead of failing later when
+    ///      the flashloan can't be covered.
     function _decreasePosition(MarketAction memory action) internal {
         Id id = action.marketId;
         require(_isRegistered[id], MarketNotRegistered(id));
         MarketParams memory params = _marketConfigs[id].params;
 
-        DecreasePlan memory plan = _planDecrease(id, action.amount);
+        DecreasePlan memory plan =
+            action.leverage > 0 ? _planDeleverage(id, action.leverage) : _planDecrease(id, action.amount);
         Call[] memory nested = _buildDecreaseBundle(params, plan, action);
 
         if (plan.flashloanAmount > 0) {
@@ -185,6 +200,63 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                 plan.flashloanAmount = plan.repayAssets;
             }
         }
+    }
+
+    /// @dev Derives how much collateral to unwind to bring the position to `targetLeverage`,
+    ///      holding equity constant: newCollateralValue = targetLeverage * equity, so the
+    ///      value withdrawn equals the value repaid, no capital in or out beyond that.
+    ///      Never a full close — see _decreasePosition's leverage-mode doc.
+    function _planDeleverage(Id id, uint256 targetLeverage) private returns (DecreasePlan memory plan) {
+        require(targetLeverage >= 1e18, LeverageBelowOneX(targetLeverage));
+
+        MarketParams memory params = _marketConfigs[id].params;
+        MORPHO.accrueInterest(params);
+        (, uint128 borrowSharesRaw, uint128 collateralRaw) = MORPHO.position(id, address(this));
+        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = MORPHO.market(id);
+
+        uint256 price = IOracle(params.oracle).price();
+        uint256 collateralValue = MorphoSharesMath.mulDivDown(collateralRaw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+        uint256 debtValue = borrowSharesRaw > 0
+            ? MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares)
+            : 0;
+
+        // Underflows (reverting) if the position is already underwater — collateral no
+        // longer covers debt, a state this engine's own health-respecting opens should
+        // never produce, but not something to silently paper over here either.
+        uint256 equity = collateralValue - debtValue;
+        uint256 currentLeverage = (collateralValue * 1e18) / equity;
+        require(targetLeverage < currentLeverage, TargetLeverageNotBelowCurrent(targetLeverage, currentLeverage));
+
+        uint256 newCollateralValue = (targetLeverage * equity) / 1e18;
+
+        // Computed in shares, not value: repaying an asset amount derived independently
+        // from a value estimate can convert back to more shares than the position actually
+        // has once rounding compounds near the margins (the same dust problem a full close
+        // avoids with exact shares, but it turns out not to be unique to the 1x case).
+        // Deriving repayShares directly from borrowSharesRaw keeps it commensurable by
+        // construction, so it can never exceed what's outstanding.
+        uint256 repayShares;
+        if (targetLeverage == 1e18) {
+            repayShares = borrowSharesRaw;
+        } else {
+            uint256 newDebtValue = newCollateralValue - equity;
+            uint256 targetBorrowShares = MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
+            // The up/down rounding chain can still overshoot by a share or two at the
+            // margins — clamp rather than let the subtraction below underflow.
+            if (targetBorrowShares > borrowSharesRaw) targetBorrowShares = borrowSharesRaw;
+            repayShares = borrowSharesRaw - targetBorrowShares;
+        }
+        require(repayShares > 0, DeleverageAmountTooSmall());
+
+        // Both the flashloan size and the collateral to withdraw are derived from
+        // repayShares, not from a separately-rounded value estimate, so the flashloan is
+        // always exactly enough to cover what Morpho will actually charge for this many
+        // shares — no cross-computation mismatch possible.
+        plan.repayShares = repayShares;
+        plan.flashloanAmount = MorphoSharesMath.toAssetsUp(repayShares, totalBorrowAssets, totalBorrowShares);
+        plan.collateralToWithdraw =
+            MorphoSharesMath.mulDivUp(plan.flashloanAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price);
+        require(plan.collateralToWithdraw <= collateralRaw, InvalidDecreaseAmount(plan.collateralToWithdraw, collateralRaw));
     }
 
     /// @dev Builds the nested Call[] for a decrease: repay (if any debt), withdraw

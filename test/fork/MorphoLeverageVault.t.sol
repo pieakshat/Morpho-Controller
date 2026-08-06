@@ -224,6 +224,83 @@ contract MorphoLeverageVaultForkTest is Test {
         vault.executeActions(actions);
     }
 
+    /// @dev Mirrors _planDeleverage's own math exactly, share-based repay amount included:
+    ///      computing the repay in Morpho's own share unit (not a separately-rounded value
+    ///      estimate) is what keeps it safely bounded by what's actually outstanding, so
+    ///      this mirrors that precisely rather than approximating it.
+    function _planDeleverage(Id id, MarketParams memory params, uint256 targetLeverage)
+        internal
+        returns (uint256 collateralToWithdraw, uint256 repayAmount)
+    {
+        IMorpho(MORPHO).accrueInterest(params);
+        (, uint128 borrowSharesRaw, uint128 collateralRaw) = IMorpho(MORPHO).position(id, address(vault));
+        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = IMorpho(MORPHO).market(id);
+
+        uint256 price = IOracle(params.oracle).price();
+        uint256 collateralValue = MorphoSharesMath.mulDivDown(collateralRaw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+        uint256 debtValue = borrowSharesRaw > 0
+            ? MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares)
+            : 0;
+
+        uint256 equity = collateralValue - debtValue;
+        uint256 newCollateralValue = (targetLeverage * equity) / 1e18;
+
+        uint256 repayShares;
+        if (targetLeverage == 1e18) {
+            repayShares = borrowSharesRaw;
+        } else {
+            uint256 newDebtValue = newCollateralValue - equity;
+            uint256 targetBorrowShares = MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
+            if (targetBorrowShares > borrowSharesRaw) targetBorrowShares = borrowSharesRaw;
+            repayShares = borrowSharesRaw - targetBorrowShares;
+        }
+
+        repayAmount = MorphoSharesMath.toAssetsUp(repayShares, totalBorrowAssets, totalBorrowShares);
+        collateralToWithdraw = MorphoSharesMath.mulDivUp(repayAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price);
+    }
+
+    /// @dev Shared live-state reader for the deleverage assertions below — pulled out
+    ///      purely to keep the test functions under Solidity's stack-depth limit.
+    function _readEquityAndLeverage(Id id, address oracle) internal view returns (uint256 equity, uint256 leverage) {
+        (, uint128 borrowSharesRaw, uint128 collateralRaw) = IMorpho(MORPHO).position(id, address(vault));
+        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = IMorpho(MORPHO).market(id);
+        uint256 price = IOracle(oracle).price();
+        uint256 collateralValue = MorphoSharesMath.mulDivDown(collateralRaw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+        uint256 debtValue = borrowSharesRaw > 0
+            ? MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares)
+            : 0;
+        equity = collateralValue - debtValue;
+        leverage = (collateralValue * 1e18) / equity;
+    }
+
+    function _deleveragePosition(Id id, MarketParams memory params, uint256 targetLeverage) internal {
+        (uint256 collateralToWithdraw, uint256 repayAmount) = _planDeleverage(id, params, targetLeverage);
+
+        // Rate rounded up so collateralToWithdraw*rate/1e18 is guaranteed >= repayAmount —
+        // _buildDecreaseSwap's own price-based rate rounds independently of this plan's
+        // own math and can leave the flashloan a couple wei short.
+        uint256 rate = MorphoSharesMath.mulDivUp(repayAmount, 1e18, collateralToWithdraw);
+        uint256 expectedOut = (collateralToWithdraw * rate) / 1e18;
+        router.setRate(rate);
+        deal(USDC, address(router), expectedOut);
+        bytes memory data =
+            abi.encodeCall(MockSwapRouter.swap, (IERC20(params.collateralToken), IERC20(USDC), collateralToWithdraw));
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: id,
+            isIncrease: false,
+            amount: 0, // ignored when leverage > 0
+            leverage: targetLeverage,
+            minOut: repayAmount,
+            swapTarget: address(router),
+            swapCalldata: data
+        });
+
+        vm.prank(owner);
+        vault.executeActions(actions);
+    }
+
     /*//////////////////////////////////////////////////////////////
                                  INCREASE
     //////////////////////////////////////////////////////////////*/
@@ -444,6 +521,139 @@ contract MorphoLeverageVaultForkTest is Test {
         assertEq(IERC20(WSTETH).balanceOf(address(swapExecutor)), 0);
 
         assertEq(vault.activeMarkets().length, 0, "full close should deactivate the market");
+    }
+
+    /// @dev Self-funded deleverage: withdraw collateral, swap it, repay debt with the
+    ///      proceeds, holding equity roughly constant while leverage drops.
+    function test_decreasePosition_deleveragesToTargetRatio() public {
+        _openPosition(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6);
+
+        (, uint128 borrowSharesBefore, uint128 collateralBefore) =
+            IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        (uint256 equityBefore,) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+
+        uint256 adapterUsdcBefore = IERC20(USDC).balanceOf(GENERAL_ADAPTER);
+        uint256 adapterCollateralBefore = IERC20(WSTETH).balanceOf(GENERAL_ADAPTER);
+
+        _deleveragePosition(wstEthMarketId, wstEthParams, 1.5e18);
+
+        (, uint128 borrowSharesAfter, uint128 collateralAfter) =
+            IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertLt(collateralAfter, collateralBefore, "collateral should shrink");
+        assertLt(borrowSharesAfter, borrowSharesBefore, "debt should shrink");
+        assertGt(borrowSharesAfter, 0, "1.5x should still leave some debt");
+
+        (uint256 equityAfter, uint256 realizedLeverage) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+
+        // Rounding in collateralToWithdraw always rounds up (withdraws slightly more than
+        // the bare minimum), so realized leverage should land at or just under the target.
+        assertLe(realizedLeverage, 1.5e18, "should never overshoot past the target leverage");
+        assertApproxEqAbs(realizedLeverage, 1.5e18, 0.001e18, "realized leverage should land close to target");
+        assertApproxEqRel(equityAfter, equityBefore, 0.001e18, "equity should stay roughly constant, self-funded");
+
+        assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
+        assertEq(
+            IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
+        );
+        assertEq(IERC20(USDC).balanceOf(address(swapExecutor)), 0);
+        assertEq(IERC20(WSTETH).balanceOf(address(swapExecutor)), 0);
+
+        assertEq(vault.activeMarkets().length, 1, "deleverage should never deactivate the market");
+    }
+
+    /// @dev Deleveraging all the way to 1x should pay off every last bit of debt (via
+    ///      exact-shares repay, not a rounded value) while still leaving collateral behind
+    ///      rather than closing the position outright.
+    function test_decreasePosition_deleverageToOneX_paysOffDebtButKeepsCollateral() public {
+        _openPosition(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6);
+
+        _deleveragePosition(wstEthMarketId, wstEthParams, 1e18);
+
+        (, uint128 borrowShares, uint128 collateral) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertEq(borrowShares, 0, "1x should pay off all debt");
+        assertGt(collateral, 0, "1x should still leave collateral behind, unlike a full close");
+
+        assertEq(vault.activeMarkets().length, 1, "deleverage to 1x should never deactivate the market");
+    }
+
+    function test_decreasePosition_revertsIfDeleverageTargetBelowOneX() public {
+        _openPosition(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6);
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: false,
+            amount: 0,
+            leverage: 1e18 - 1,
+            minOut: 0,
+            swapTarget: address(router),
+            swapCalldata: ""
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLeverageEngine.LeverageBelowOneX.selector, 1e18 - 1));
+        vault.executeActions(actions);
+    }
+
+    function test_decreasePosition_revertsIfDeleverageTargetNotBelowCurrent() public {
+        _openPosition(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6);
+
+        (, uint256 currentLeverage) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: false,
+            amount: 0,
+            leverage: currentLeverage,
+            minOut: 0,
+            swapTarget: address(router),
+            swapCalldata: ""
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                MorphoLeverageEngine.TargetLeverageNotBelowCurrent.selector, currentLeverage, currentLeverage
+            )
+        );
+        vault.executeActions(actions);
+    }
+
+    /// @dev Fuzzes both the starting leverage and how far below it the target sits,
+    ///      confirming the realized leverage always lands at or under the target and
+    ///      equity stays roughly flat regardless of the specific starting point.
+    function testFuzz_decreasePosition_deleveragesToAnyValidTarget(uint256 startLeverage, uint256 targetFraction)
+        public
+    {
+        startLeverage = bound(startLeverage, 1.1e18, 5e18);
+        // Target somewhere between 1x and just under the starting leverage.
+        targetFraction = bound(targetFraction, 0, 0.999e18);
+        uint256 targetLeverage = 1e18 + ((startLeverage - 1e18) * targetFraction) / 1e18;
+
+        _openPositionWithLeverage(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6, startLeverage);
+        (uint256 equityBefore,) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+
+        _deleveragePosition(wstEthMarketId, wstEthParams, targetLeverage);
+
+        (, uint128 borrowSharesAfter, uint128 collateralAfter) =
+            IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+
+        // Not asserting "some debt remains" for target > 1x: the conservative rounding in
+        // _planDeleverage (never leave the position above target) means a target very
+        // close to 1x can legitimately round down to a full payoff too, same as target
+        // == 1x exactly. Only exact 1x is asserted precisely; collateral surviving is the
+        // one invariant that holds unconditionally.
+        if (targetLeverage == 1e18) {
+            assertEq(borrowSharesAfter, 0);
+        }
+        assertGt(collateralAfter, 0, "deleverage should never fully close the position");
+
+        (uint256 equityAfter, uint256 realizedLeverage) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+        if (targetLeverage > 1e18) {
+            assertLe(realizedLeverage, targetLeverage, "should never overshoot past the target leverage");
+        }
+        assertApproxEqRel(equityAfter, equityBefore, 0.001e18, "equity should stay roughly constant, self-funded");
     }
 
     /*//////////////////////////////////////////////////////////////

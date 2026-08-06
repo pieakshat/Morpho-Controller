@@ -26,11 +26,15 @@ struct MarketAction {
     Id marketId;
     /// @notice true = increase this market's position, false = decrease it.
     bool isIncrease;
-    /// @notice Amount for this leg, in whichever token the operation naturally denominates in.
+    /// @notice For increases: this adapter's own contribution to the position. For
+    ///         decreases with leverage == 0: collateral to withdraw, or type(uint256).max
+    ///         for a full close. Ignored for decreases with leverage > 0.
     uint256 amount;
     /// @notice For increases: the leverage this specific action targets, in WAD (1e18 =
     ///         1x, no borrow). Must fall between 1e18 and the market's maxLeverage.
-    ///         Ignored for decreases.
+    ///         For decreases: 0 means use `amount` as an explicit collateral withdrawal;
+    ///         any value >= 1e18 instead deleverages the position down to that ratio,
+    ///         ignoring `amount`. Must be below the position's current leverage.
     uint256 leverage;
     /// @notice Our own oracle-independent slippage floor for this leg's swap, if any.
     uint256 minOut;
