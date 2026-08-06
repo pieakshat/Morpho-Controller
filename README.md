@@ -4,7 +4,7 @@ An ERC4626 vault that opens and closes leveraged positions on Morpho Blue using 
 
 ## Status
 
-The contracts and their test suite are complete and passing (56 tests, including fork tests against real Arbitrum mainnet contracts). The off-chain allocator service that will actually drive the vault day to day has not been built yet. See [Status and roadmap](#status-and-roadmap).
+The contracts and their test suite are complete and passing (61 tests, including fork tests against real Arbitrum mainnet contracts). The off-chain allocator service that will actually drive the vault day to day has not been built yet. See [Status and roadmap](#status-and-roadmap).
 
 ## Overview
 
@@ -91,7 +91,7 @@ Requesting less than 1x or more than the market's ceiling reverts before any of 
 
 ## Closing or reducing a position
 
-A decrease can be partial (an explicit collateral amount) or a full close (`type(uint256).max`). A full close repays the exact borrow shares rather than a rounded asset estimate, to avoid leaving dust debt behind.
+A decrease has two modes, selected by `action.leverage`. With `leverage == 0`, `action.amount` is an explicit collateral amount to withdraw, or `type(uint256).max` for a full close, and debt is repaid proportionally to how much collateral comes out (a full close repays the exact borrow shares rather than a rounded asset estimate, to avoid leaving dust debt behind). With `leverage >= 1e18`, `action.amount` is ignored and the position is instead deleveraged down to that target ratio in place, covered in the next section.
 
 ```mermaid
 sequenceDiagram
@@ -120,6 +120,42 @@ sequenceDiagram
 The note in that diagram matters: Morpho Blue's `flashLoan()` sends the loan, runs the callback, and reclaims the loan back, all inside one external call. Anything meant to cover that reclaim has to already be sitting on GeneralAdapter1 before the callback returns. That is why the swap proceeds land on GeneralAdapter1 during a decrease, not on the vault directly, and why the leftover is swept back to the vault only afterward, as a "whatever remains" transfer rather than a precomputed amount, since real swap slippage means the exact leftover is not known in advance.
 
 If a position has no debt at all, either because it is a 1x position or because it has already been fully repaid, the decrease skips the flashloan entirely and just withdraws and swaps directly.
+
+## Deleveraging a position in place
+
+Reducing exposure and reducing leverage are different operations. Withdrawing collateral proportionally (the mode above) shrinks a position while keeping its leverage ratio the same. Bringing a 2x position down to 1.5x without closing it needs something else: shrink the position using only its own collateral, holding the underlying equity fixed.
+
+The math: leverage is `collateral / equity`, where `equity = collateral - debt`. To hit a target leverage while holding equity constant, the new collateral value has to be `target * equity`. The difference between that and the current collateral is exactly how much collateral to unwind, swap, and use to repay debt, nothing more. No capital comes from or returns to idle balance beyond whatever the swap delivers above `action.minOut`.
+
+```mermaid
+sequenceDiagram
+    participant Allocator
+    participant Vault
+    participant Bundler3
+    participant GA as GeneralAdapter1
+    participant Morpho
+    participant Swap
+
+    Allocator->>Vault: executeActions([decrease, leverage = target])
+    Note over Vault: newCollateralValue = target * equity<br/>unwind = collateralValue - newCollateralValue
+    Vault->>Bundler3: multicall(flashLoan repayAmount)
+    Bundler3->>Morpho: flashLoan(repayAmount)
+    Morpho->>GA: send repayAmount
+    Morpho->>GA: onMorphoFlashLoan callback
+    GA->>Bundler3: reenter with nested calls
+    Bundler3->>Morpho: repay(repayAmount)
+    Bundler3->>Morpho: withdrawCollateral, receiver GA
+    Bundler3->>Swap: swap collateral for loanToken
+    Swap->>GA: send loanToken proceeds
+    Morpho->>GA: reclaim repayAmount, same call
+    Vault->>GA: sweep remaining balance back to vault
+```
+
+This reuses the exact same bundle shape as a plain decrease, since the same constraint applies: Morpho's `withdrawCollateral` checks position health immediately, against whatever debt is on the books at that moment. Debt has to come down before collateral comes out, which is why this needs a flashloan too, not a simple "withdraw then repay."
+
+The repay amount is computed in Morpho's own share unit, not derived from a separately-rounded value estimate. Converting a value estimate back into an asset amount can, at small margins, round to slightly more shares than the position actually has, and Morpho's repay call reverts outright rather than partially filling. Computing directly in shares keeps the repay amount inherently bounded by what's actually outstanding.
+
+`action.minOut` does the same job here as everywhere else: it is the floor on the collateral-to-loanToken swap. Set it below the computed repay amount and a bad fill reverts cleanly in the swap executor, instead of failing later when the flashloan can't be covered. A target of exactly `1e18` pays off all debt using exact shares (same reasoning as a full close) but still leaves collateral behind, since only the debt side ends up at zero, not the whole position. Requesting a target at or above the position's current leverage reverts with `TargetLeverageNotBelowCurrent`; there is nothing to unwind in that direction.
 
 ## Repository layout
 
