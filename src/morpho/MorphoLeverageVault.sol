@@ -127,9 +127,9 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
                                 REGISTRY ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Adds `params` to the market whitelist at the given target leverage.
-    function registerMarket(MarketParams calldata params, uint256 targetLeverage) external onlyOwner returns (Id) {
-        return _registerMarket(params, targetLeverage);
+    /// @notice Adds `params` to the market whitelist with the given leverage ceiling.
+    function registerMarket(MarketParams calldata params, uint256 maxLeverage) external onlyOwner returns (Id) {
+        return _registerMarket(params, maxLeverage);
     }
 
     /// @notice Enables or disables new increases into an already-registered market.
@@ -137,9 +137,9 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
         _setMarketEnabled(id, enabled);
     }
 
-    /// @notice Updates the target leverage used by future increases into a market.
-    function setMarketLeverage(Id id, uint256 targetLeverage) external onlyOwner {
-        _setMarketLeverage(id, targetLeverage);
+    /// @notice Updates the leverage ceiling an allocator's increases may request.
+    function setMaxLeverage(Id id, uint256 maxLeverage) external onlyOwner {
+        _setMaxLeverage(id, maxLeverage);
     }
 
     /// @notice Grants or revokes allocator rights (the ability to call executeActions).

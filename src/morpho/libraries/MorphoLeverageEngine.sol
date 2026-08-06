@@ -17,6 +17,8 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     using SafeERC20 for IERC20;
 
     error MarketNotEnabled(Id id);
+    error LeverageBelowOneX(uint256 requested);
+    error LeverageExceedsMax(uint256 requested, uint256 max);
     error InvalidDecreaseAmount(uint256 requested, uint256 available);
 
     /// @dev Groups _decreasePosition's derived numbers into one struct, passed by memory
@@ -33,12 +35,15 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                                   INCREASE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Opens or adds to a position in one flashloan-atomic bundle. Leverage is
-    ///         optional: a market registered at exactly 1e18 (see MorphoMarketConfig)
-    ///         supplies collateral with no borrow at all.
+    /// @notice Opens or adds to a position in one flashloan-atomic bundle. `action.leverage`
+    ///         picks the leverage for this call, capped by the market's maxLeverage.
+    ///         Leverage is optional: a request of exactly 1e18 supplies collateral with no
+    ///         borrow at all.
     /// @dev `action.amount` is this adapter's own contribution, not the total position
-    ///      size. Total exposure and the borrow amount are derived from it via the
-    ///      market's configured targetLeverage.
+    ///      size. Total exposure and the borrow amount are derived from it via
+    ///      `action.leverage`, chosen by the allocator per call rather than fixed on the
+    ///      market's config, so the same market can be entered at different leverage in
+    ///      different calls without any owner transaction in between.
     function _increasePosition(MarketAction memory action) internal {
         Id id = action.marketId;
         require(isMarketEnabled(id), MarketNotEnabled(id));
@@ -46,8 +51,12 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         MorphoMarketConfig memory config = _marketConfigs[id];
         MarketParams memory params = config.params;
 
+        uint256 leverage = action.leverage;
+        require(leverage >= 1e18, LeverageBelowOneX(leverage));
+        require(leverage <= config.maxLeverage, LeverageExceedsMax(leverage, config.maxLeverage));
+
         uint256 ownAmount = action.amount;
-        uint256 totalAmount = (ownAmount * config.targetLeverage) / 1e18;
+        uint256 totalAmount = (ownAmount * leverage) / 1e18;
         uint256 borrowAmount = totalAmount - ownAmount;
 
         // Plain transfer rather than a bundled Call: inside a bundle a Call here would

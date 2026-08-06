@@ -42,6 +42,10 @@ contract MorphoLeverageVaultForkTest is Test {
     uint256 constant FORK_BLOCK = 491_260_000;
 
     uint256 constant LEVERAGE_2X = 2e18;
+    // Registered as each market's ceiling in setUp, comfortably above every leverage used
+    // in this file (up to 5x in the fuzz tests) — actions pick their own leverage per call,
+    // this only bounds how high they're allowed to go without the owner raising it.
+    uint256 constant MAX_LEVERAGE_CEILING = 10e18;
     uint256 constant DEPOSIT_AMOUNT = 1_000_000e6;
 
     MorphoLeverageVault vault;
@@ -73,8 +77,8 @@ contract MorphoLeverageVaultForkTest is Test {
             MarketParams({loanToken: USDC, collateralToken: WETH, oracle: WETH_ORACLE, irm: IRM, lltv: LLTV_86});
 
         vm.startPrank(owner);
-        wstEthMarketId = vault.registerMarket(wstEthParams, LEVERAGE_2X);
-        wethMarketId = vault.registerMarket(wethParams, LEVERAGE_2X);
+        wstEthMarketId = vault.registerMarket(wstEthParams, MAX_LEVERAGE_CEILING);
+        wethMarketId = vault.registerMarket(wethParams, MAX_LEVERAGE_CEILING);
         vm.stopPrank();
 
         // Real ERC4626 deposit, not a raw deal() into the vault — gives us an actual
@@ -149,8 +153,10 @@ contract MorphoLeverageVaultForkTest is Test {
         return _openPositionWithLeverage(id, params, oracle, ownAmount, LEVERAGE_2X);
     }
 
-    /// @dev Same as _openPosition, but with leverage as an explicit parameter — used by the
-    ///      fuzz tests below, which vary leverage per run via setMarketLeverage.
+    /// @dev Same as _openPosition, but with leverage as an explicit parameter, passed
+    ///      straight through in the action itself rather than configured on the market —
+    ///      used by the fuzz tests below to vary leverage per run with no owner call
+    ///      needed, only the registered ceiling in setUp bounds what's allowed.
     function _openPositionWithLeverage(
         Id id,
         MarketParams memory params,
@@ -166,6 +172,7 @@ contract MorphoLeverageVaultForkTest is Test {
             marketId: id,
             isIncrease: true,
             amount: ownAmount,
+            leverage: leverage,
             minOut: expectedOut,
             swapTarget: address(router),
             swapCalldata: data
@@ -207,6 +214,7 @@ contract MorphoLeverageVaultForkTest is Test {
             marketId: id,
             isIncrease: false,
             amount: requestedAmount,
+            leverage: 0, // ignored for decreases
             minOut: expectedOut,
             swapTarget: address(router),
             swapCalldata: data
@@ -254,6 +262,7 @@ contract MorphoLeverageVaultForkTest is Test {
             marketId: wstEthMarketId,
             isIncrease: true,
             amount: 1_000e6,
+            leverage: LEVERAGE_2X,
             minOut: 0,
             swapTarget: address(router),
             swapCalldata: ""
@@ -264,12 +273,88 @@ contract MorphoLeverageVaultForkTest is Test {
         vault.executeActions(actions);
     }
 
-    /// @dev A market registered at exactly 1e18 leverage should supply collateral with
-    ///      zero borrow, not revert — the flashloan's borrow leg is simply omitted.
-    function test_increasePosition_atOneXLeverage_suppliesWithNoDebt() public {
-        vm.prank(owner);
-        vault.setMarketLeverage(wethMarketId, 1e18);
+    function test_increasePosition_revertsIfLeverageBelowOneX() public {
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: 1_000e6,
+            leverage: 1e18 - 1,
+            minOut: 0,
+            swapTarget: address(router),
+            swapCalldata: ""
+        });
 
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLeverageEngine.LeverageBelowOneX.selector, 1e18 - 1));
+        vault.executeActions(actions);
+    }
+
+    function test_increasePosition_revertsIfLeverageExceedsMax() public {
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: 1_000e6,
+            leverage: MAX_LEVERAGE_CEILING + 1,
+            minOut: 0,
+            swapTarget: address(router),
+            swapCalldata: ""
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                MorphoLeverageEngine.LeverageExceedsMax.selector, MAX_LEVERAGE_CEILING + 1, MAX_LEVERAGE_CEILING
+            )
+        );
+        vault.executeActions(actions);
+    }
+
+    function testFuzz_increasePosition_revertsIfLeverageBelowOneX(uint256 leverage) public {
+        leverage = bound(leverage, 0, 1e18 - 1);
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: 1_000e6,
+            leverage: leverage,
+            minOut: 0,
+            swapTarget: address(router),
+            swapCalldata: ""
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLeverageEngine.LeverageBelowOneX.selector, leverage));
+        vault.executeActions(actions);
+    }
+
+    function testFuzz_increasePosition_revertsIfLeverageExceedsMax(uint256 leverage) public {
+        leverage = bound(leverage, MAX_LEVERAGE_CEILING + 1, type(uint128).max);
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: 1_000e6,
+            leverage: leverage,
+            minOut: 0,
+            swapTarget: address(router),
+            swapCalldata: ""
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(MorphoLeverageEngine.LeverageExceedsMax.selector, leverage, MAX_LEVERAGE_CEILING)
+        );
+        vault.executeActions(actions);
+    }
+
+    /// @dev An action requesting exactly 1e18 leverage should supply collateral with zero
+    ///      borrow, not revert — the flashloan's borrow leg is simply omitted. No owner
+    ///      call needed: 1e18 is always within any market's ceiling.
+    function test_increasePosition_atOneXLeverage_suppliesWithNoDebt() public {
         uint256 ownAmount = 50_000e6;
         uint256 adapterUsdcBefore = IERC20(USDC).balanceOf(GENERAL_ADAPTER);
         uint256 adapterCollateralBefore = IERC20(WETH).balanceOf(GENERAL_ADAPTER);
@@ -301,8 +386,6 @@ contract MorphoLeverageVaultForkTest is Test {
     ///      branch — the only existing coverage of that branch used a position that never
     ///      had debt to begin with, not one opened for real through the increase path.
     function test_decreasePosition_atOneXLeverage_withdrawsWithoutFlashloan() public {
-        vm.prank(owner);
-        vault.setMarketLeverage(wethMarketId, 1e18);
         _openPositionWithLeverage(wethMarketId, wethParams, WETH_ORACLE, 50_000e6, 1e18);
 
         uint256 idleBefore = IERC20(USDC).balanceOf(address(vault));
@@ -388,6 +471,7 @@ contract MorphoLeverageVaultForkTest is Test {
             marketId: wstEthMarketId,
             isIncrease: false,
             amount: type(uint256).max,
+            leverage: 0, // ignored for decreases
             minOut: decreaseExpectedOut,
             swapTarget: address(router),
             swapCalldata: decreaseData
@@ -396,6 +480,7 @@ contract MorphoLeverageVaultForkTest is Test {
             marketId: wethMarketId,
             isIncrease: true,
             amount: wethOwnAmount,
+            leverage: LEVERAGE_2X,
             minOut: increaseExpectedOut,
             swapTarget: address(router2),
             swapCalldata: increaseData
@@ -490,9 +575,6 @@ contract MorphoLeverageVaultForkTest is Test {
         ownAmount = bound(ownAmount, 1e6, 100_000e6);
         leverage = bound(leverage, 1.01e18, 5e18);
 
-        vm.prank(owner);
-        vault.setMarketLeverage(wstEthMarketId, leverage);
-
         uint256 adapterUsdcBefore = IERC20(USDC).balanceOf(GENERAL_ADAPTER);
         uint256 adapterCollateralBefore = IERC20(WSTETH).balanceOf(GENERAL_ADAPTER);
 
@@ -527,8 +609,6 @@ contract MorphoLeverageVaultForkTest is Test {
         leverage = bound(leverage, 1.01e18, 5e18);
         withdrawPct = bound(withdrawPct, 1, 99); // strictly partial — full close is covered separately
 
-        vm.prank(owner);
-        vault.setMarketLeverage(wstEthMarketId, leverage);
         _openPositionWithLeverage(wstEthMarketId, wstEthParams, WSTETH_ORACLE, ownAmount, leverage);
 
         (, uint128 borrowSharesBefore, uint128 collateralBefore) =

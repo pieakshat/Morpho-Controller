@@ -5,15 +5,15 @@ import {Id, MarketParams} from "../interfaces/IMorpho.sol";
 
 /// @notice A single market this adapter is permitted to hold a position in.
 /// @dev Lives in the registry (whitelist), managed by the allocator/owner — not per-action.
-///      Leverage is a property of the market strategy, not a one-off instruction.
+///      The actual leverage used for a given increase is chosen by the allocator per call
+///      (see MarketAction.leverage) and only capped here.
 struct MorphoMarketConfig {
     /// @dev The real Morpho market this config describes. Its Id is derivable from this —
     ///      keccak256(abi.encode(params)) — we don't store the Id redundantly.
     MarketParams params;
-    /// @notice 1e18 = no leverage (plain seeding, no debt). Values above 1e18 open a
-    ///         leveraged position on increase.
-    /// @dev Leverage is achieved via flashloan-based looping — see MorphoLeverageEngine.
-    uint256 targetLeverage;
+    /// @notice Ceiling on the leverage any single increase into this market may request.
+    ///         1e18 = no leverage above 1x is ever allowed here.
+    uint256 maxLeverage;
     /// @notice The whitelist gate — the allocator can only act on a market where this is true.
     bool enabled;
 }
@@ -28,6 +28,10 @@ struct MarketAction {
     bool isIncrease;
     /// @notice Amount for this leg, in whichever token the operation naturally denominates in.
     uint256 amount;
+    /// @notice For increases: the leverage this specific action targets, in WAD (1e18 =
+    ///         1x, no borrow). Must fall between 1e18 and the market's maxLeverage.
+    ///         Ignored for decreases.
+    uint256 leverage;
     /// @notice Our own oracle-independent slippage floor for this leg's swap, if any.
     uint256 minOut;
     /// @notice Swap venue for this leg. address(0) if this leg needs no swap.

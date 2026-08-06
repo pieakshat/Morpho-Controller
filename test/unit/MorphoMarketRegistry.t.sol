@@ -12,7 +12,7 @@ import {MorphoLeverageVault} from "../../src/morpho/MorphoLeverageVault.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 
 /// @notice Registry behavior exercised through MorphoLeverageVault's real owner-gated
-///         entry points (registerMarket/setMarketEnabled/setMarketLeverage), not a
+///         entry points (registerMarket/setMarketEnabled/setMaxLeverage), not a
 ///         standalone internal-function harness — this is the actual surface a real
 ///         deployment uses. MORPHO/BUNDLER3/GENERAL_ADAPTER/SWAP_EXECUTOR are inert
 ///         placeholder addresses here: nothing in this tier calls out to them.
@@ -59,7 +59,7 @@ contract MorphoMarketRegistryTest is Test {
         Id id = vault.registerMarket(params, 2e18);
 
         assertTrue(vault.isMarketEnabled(id));
-        assertEq(vault.marketConfig(id).targetLeverage, 2e18);
+        assertEq(vault.marketConfig(id).maxLeverage, 2e18);
     }
 
     function test_registerMarket_revertsOnDuplicate() public {
@@ -130,28 +130,28 @@ contract MorphoMarketRegistryTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                              SET MARKET LEVERAGE
+                               SET MAX LEVERAGE
     //////////////////////////////////////////////////////////////*/
 
-    function test_setMarketLeverage_updatesAndRevertsOnInvalid() public {
+    function test_setMaxLeverage_updatesAndRevertsOnInvalid() public {
         vm.startPrank(owner);
         Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
 
-        vault.setMarketLeverage(id, 3e18);
-        assertEq(vault.marketConfig(id).targetLeverage, 3e18);
+        vault.setMaxLeverage(id, 3e18);
+        assertEq(vault.marketConfig(id).maxLeverage, 3e18);
 
         vm.expectRevert(MorphoMarketRegistry.InvalidLeverage.selector);
-        vault.setMarketLeverage(id, 1e18 - 1);
+        vault.setMaxLeverage(id, 1e18 - 1);
         vm.stopPrank();
     }
 
-    function test_setMarketLeverage_onlyOwner() public {
+    function test_setMaxLeverage_onlyOwner() public {
         vm.prank(owner);
         Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        vault.setMarketLeverage(id, 3e18);
+        vault.setMaxLeverage(id, 3e18);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -209,7 +209,7 @@ contract MorphoMarketRegistryTest is Test {
         Id id = vault.registerMarket(params, leverage);
 
         assertTrue(vault.isMarketEnabled(id));
-        assertEq(vault.marketConfig(id).targetLeverage, leverage);
+        assertEq(vault.marketConfig(id).maxLeverage, leverage);
     }
 
     function testFuzz_registerMarket_revertsForAnyInvalidLeverage(uint256 leverage) public {
@@ -220,14 +220,14 @@ contract MorphoMarketRegistryTest is Test {
         vault.registerMarket(_params(address(0xC01)), leverage);
     }
 
-    function testFuzz_setMarketLeverage_revertsForAnyInvalidLeverage(uint256 newLeverage) public {
+    function testFuzz_setMaxLeverage_revertsForAnyInvalidLeverage(uint256 newLeverage) public {
         newLeverage = bound(newLeverage, 0, 1e18 - 1);
 
         vm.startPrank(owner);
         Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
 
         vm.expectRevert(MorphoMarketRegistry.InvalidLeverage.selector);
-        vault.setMarketLeverage(id, newLeverage);
+        vault.setMaxLeverage(id, newLeverage);
         vm.stopPrank();
     }
 
@@ -251,7 +251,7 @@ contract MorphoMarketRegistryTest is Test {
         vault.setMarketEnabled(id, false);
 
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, caller));
-        vault.setMarketLeverage(id, 3e18);
+        vault.setMaxLeverage(id, 3e18);
         vm.stopPrank();
     }
 }

@@ -16,9 +16,9 @@ abstract contract MorphoMarketRegistry {
     error InvalidLeverage();
     error LoanTokenMismatch(address expected, address actual);
 
-    event MarketRegistered(Id indexed id, uint256 targetLeverage);
+    event MarketRegistered(Id indexed id, uint256 maxLeverage);
     event MarketEnabledSet(Id indexed id, bool enabled);
-    event MarketLeverageUpdated(Id indexed id, uint256 targetLeverage);
+    event MarketMaxLeverageUpdated(Id indexed id, uint256 maxLeverage);
     event MarketActivated(Id indexed id);
     event MarketDeactivated(Id indexed id);
 
@@ -52,17 +52,17 @@ abstract contract MorphoMarketRegistry {
 
     /// @notice Adds a new market to the whitelist, enabled by default.
     /// @dev Id is derived from params, not passed in — can't register a mismatched pair.
-    function _registerMarket(MarketParams memory params, uint256 targetLeverage) internal returns (Id id) {
+    function _registerMarket(MarketParams memory params, uint256 maxLeverage) internal returns (Id id) {
         require(params.loanToken == ASSET, LoanTokenMismatch(ASSET, params.loanToken));
-        require(targetLeverage >= 1e18, InvalidLeverage());
+        require(maxLeverage >= 1e18, InvalidLeverage());
         id = _computeId(params);
         require(!_isRegistered[id], MarketAlreadyRegistered(id));
 
         _isRegistered[id] = true;
-        _marketConfigs[id] = MorphoMarketConfig({params: params, targetLeverage: targetLeverage, enabled: true});
+        _marketConfigs[id] = MorphoMarketConfig({params: params, maxLeverage: maxLeverage, enabled: true});
         _registeredMarkets.push(id);
 
-        emit MarketRegistered(id, targetLeverage);
+        emit MarketRegistered(id, maxLeverage);
     }
 
     /// @notice Enables or disables new increases into a market. Does NOT touch existing
@@ -72,10 +72,12 @@ abstract contract MorphoMarketRegistry {
         emit MarketEnabledSet(id, enabled);
     }
 
-    function _setMarketLeverage(Id id, uint256 targetLeverage) internal onlyRegistered(id) {
-        require(targetLeverage >= 1e18, InvalidLeverage());
-        _marketConfigs[id].targetLeverage = targetLeverage;
-        emit MarketLeverageUpdated(id, targetLeverage);
+    /// @notice Updates the leverage ceiling. Does not touch any leverage already in use by
+    ///         an open position, only what future increases may request.
+    function _setMaxLeverage(Id id, uint256 maxLeverage) internal onlyRegistered(id) {
+        require(maxLeverage >= 1e18, InvalidLeverage());
+        _marketConfigs[id].maxLeverage = maxLeverage;
+        emit MarketMaxLeverageUpdated(id, maxLeverage);
     }
 
     /*//////////////////////////////////////////////////////////////
