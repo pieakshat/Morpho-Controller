@@ -4,7 +4,7 @@ An ERC4626 vault that opens and closes leveraged positions on Morpho Blue using 
 
 ## Status
 
-The contracts and their test suite are complete and passing (81 tests, including fork tests and an adversarial audit suite that both run against real Arbitrum mainnet contracts). The off-chain allocator service that will actually drive the vault day to day has not been built yet. See [Status and roadmap](#status-and-roadmap).
+The contracts and their test suite are complete and passing (84 tests, including fork tests and an adversarial audit suite that both run against real Arbitrum mainnet contracts). The off-chain allocator service that will actually drive the vault day to day has not been built yet. See [Status and roadmap](#status-and-roadmap).
 
 ## Overview
 
@@ -91,7 +91,9 @@ Requesting less than 1x or more than the market's ceiling reverts before any of 
 
 ## Closing or reducing a position
 
-A decrease has two modes, selected by `action.leverage`. With `leverage == 0`, `action.amount` is an explicit collateral amount to withdraw, or `type(uint256).max` for a full close, and debt is repaid proportionally to how much collateral comes out (a full close repays the exact borrow shares rather than a rounded asset estimate, to avoid leaving dust debt behind). With `leverage >= 1e18`, `action.amount` is ignored and the position is instead deleveraged down to that target ratio in place, covered in the next section.
+A decrease has two modes, selected by `action.leverage`. With `leverage == 0`, `action.amount` is an explicit collateral amount to withdraw, and debt is repaid proportionally to how much collateral comes out. With `leverage >= 1e18`, `action.amount` is ignored and the position is instead deleveraged down to that target ratio in place, covered in the next section.
+
+Either `type(uint256).max` or the exact current collateral balance means a full close, and both take the same path: repay the precise borrow shares rather than a rounded asset estimate, so no dust debt is left behind. A decrease too small to repay anything is rejected rather than silently pulling collateral out for free.
 
 ```mermaid
 sequenceDiagram
@@ -167,14 +169,14 @@ The allocator is a hot key that picks both the swap venue and the calldata sent 
 
 **Shortfalls are netted, not floored.** A position whose debt exceeds its collateral has negative value. `totalAssets()` subtracts that shortfall from the vault total, including from idle balance, rather than reporting the position as merely worth zero. Otherwise the share price would overstate solvency by the size of the shortfall, and since idle balance stays withdrawable, whoever redeemed first would exit at that stale price and leave the loss to everyone who waited. The total floors at zero rather than underflowing if a shortfall ever exceeds everything the vault holds.
 
+**A failing oracle degrades valuation instead of halting the vault.** `totalAssets()` reads every active market's oracle, so a single reverting oracle used to block deposits and withdrawals for everyone, including against idle balance unrelated to that market. An unpriceable market's collateral is now valued at zero while its debt still counts, which can only under-report, never over-report, so nobody can redeem at a price the vault cannot substantiate. `isMarketPriceable(id)` tells an operator whether a low valuation means "worth little" or "cannot currently see". Increases and deleverages against that market still revert, since neither can derive a safe swap floor without a price.
+
 **Swap executor is bound to one vault.** `MorphoSwapExecutor` is deployed by the vault itself, so it records that vault as its only authorized user. Because it runs inside a Bundler3 bundle, `msg.sender` is Bundler3 rather than the vault, and Bundler3 is permissionless. It therefore authorizes on the bundle's `initiator()` being its own vault, which no outside caller can forge. Both token balances are also swept to the vault before returning, so a router that under-consumes its allowance never leaves anything behind.
 
 Known gaps, not yet addressed:
 
-- `totalAssets()` reads every active market's oracle, so one reverting oracle blocks deposits and withdrawals for the whole vault, including funds unrelated to that market.
-- A decrease whose amount is exactly the full collateral balance reverts. Use the `type(uint256).max` sentinel to fully exit.
-- A decrease small enough that the proportional repayment rounds to zero withdraws collateral without repaying anything, nudging leverage up. Bounded by the health check and negligible in value, but it does break the proportionality the function documents.
-- Nothing on-chain enforces an idle buffer, so depositors can only withdraw whatever the allocator happens to have left uninvested.
+- Nothing on-chain enforces an idle buffer, so depositors can only withdraw whatever the allocator happens to have left uninvested. Keeping enough idle to honor redemptions is the off-chain engine's job.
+- A liquidation is visible in valuation after the fact but nothing on-chain prevents one. Monitoring position health is also the off-chain engine's job.
 
 ## Repository layout
 
