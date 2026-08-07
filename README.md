@@ -4,7 +4,7 @@ An ERC4626 vault that opens and closes leveraged positions on Morpho Blue using 
 
 ## Status
 
-The contracts and their test suite are complete and passing (61 tests, including fork tests against real Arbitrum mainnet contracts). The off-chain allocator service that will actually drive the vault day to day has not been built yet. See [Status and roadmap](#status-and-roadmap).
+The contracts and their test suite are complete and passing (81 tests, including fork tests and an adversarial audit suite that both run against real Arbitrum mainnet contracts). The off-chain allocator service that will actually drive the vault day to day has not been built yet. See [Status and roadmap](#status-and-roadmap).
 
 ## Overview
 
@@ -12,7 +12,7 @@ Depositors put a single asset (for example USDC) into the vault and receive shar
 
 Leverage is achieved through a single atomic flashloan rather than repeated supply and borrow loops. One transaction borrows the extra capital, swaps it into collateral, supplies the collateral, and borrows against it to repay the flashloan, all inside one Morpho Blue flashloan callback. A market can also be registered at 1x, in which case the vault just supplies collateral with no borrow at all.
 
-Swaps are done through an arbitrary external venue supplied by the allocator (a DEX aggregator quote, typically). The vault only enforces a minimum output amount on that swap. It does not pick the route itself.
+Swaps are done through an arbitrary external venue supplied by the allocator (a DEX aggregator quote, typically). The vault does not pick the route, but it does refuse any fill that lands too far below the market oracle's price. See [Safety model](#safety-model).
 
 ## Architecture
 
@@ -43,7 +43,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     Depositor(["Depositor"]) -->|deposit / withdraw USDC| Vault["MorphoLeverageVault"]
-    Owner(["Owner"]) -->|registerMarket, setMaxLeverage, setAllocator| Vault
+    Owner(["Owner"]) -->|registerMarket, setMaxLeverage, setMaxSlippageBps, setAllocator| Vault
     Allocator(["Off-chain allocator<br/>Node.js service, not built yet"]) -->|executeActions| Vault
     Vault -->|flashloan bundle| Bundler3["Bundler3"]
     Bundler3 --> GeneralAdapter1
@@ -157,6 +157,25 @@ The repay amount is computed in Morpho's own share unit, not derived from a sepa
 
 `action.minOut` does the same job here as everywhere else: it is the floor on the collateral-to-loanToken swap. Set it below the computed repay amount and a bad fill reverts cleanly in the swap executor, instead of failing later when the flashloan can't be covered. A target of exactly `1e18` pays off all debt using exact shares (same reasoning as a full close) but still leaves collateral behind, since only the debt side ends up at zero, not the whole position. Requesting a target at or above the position's current leverage reverts with `TargetLeverageNotBelowCurrent`; there is nothing to unwind in that direction.
 
+## Safety model
+
+The allocator is a hot key that picks both the swap venue and the calldata sent to it. The system is built so that a compromised allocator cannot drain the vault, rather than assuming it stays honest.
+
+**Oracle-anchored swap floor.** Every swap leg's minimum output is computed inside the contract from the market's own Morpho oracle, less that market's `maxSlippageBps`. The allocator's `minOut` is only ever raised to meet that floor, never allowed to lower it, so routing through a venue the allocator controls cannot settle at an arbitrary price. `maxSlippageBps` is per market, owner-set, and hard-capped at 10% by the registry.
+
+**Per-call value check.** `executeActions` records `totalAssets()` before and after and reverts if the call destroyed more than `actionDropToleranceBps` (default 1%, owner-set, hard-capped at 10%). Any action is close to value-neutral in principle, since it just converts idle capital into an equally valuable position or back. This is the backstop for anything the per-swap floor misses, including losses spread across several actions in one call.
+
+**Shortfalls are netted, not floored.** A position whose debt exceeds its collateral has negative value. `totalAssets()` subtracts that shortfall from the vault total, including from idle balance, rather than reporting the position as merely worth zero. Otherwise the share price would overstate solvency by the size of the shortfall, and since idle balance stays withdrawable, whoever redeemed first would exit at that stale price and leave the loss to everyone who waited. The total floors at zero rather than underflowing if a shortfall ever exceeds everything the vault holds.
+
+**Swap executor is bound to one vault.** `MorphoSwapExecutor` is deployed by the vault itself, so it records that vault as its only authorized user. Because it runs inside a Bundler3 bundle, `msg.sender` is Bundler3 rather than the vault, and Bundler3 is permissionless. It therefore authorizes on the bundle's `initiator()` being its own vault, which no outside caller can forge. Both token balances are also swept to the vault before returning, so a router that under-consumes its allowance never leaves anything behind.
+
+Known gaps, not yet addressed:
+
+- `totalAssets()` reads every active market's oracle, so one reverting oracle blocks deposits and withdrawals for the whole vault, including funds unrelated to that market.
+- A decrease whose amount is exactly the full collateral balance reverts. Use the `type(uint256).max` sentinel to fully exit.
+- A decrease small enough that the proportional repayment rounds to zero withdraws collateral without repaying anything, nudging leverage up. Bounded by the health check and negligible in value, but it does break the proportionality the function documents.
+- Nothing on-chain enforces an idle buffer, so depositors can only withdraw whatever the allocator happens to have left uninvested.
+
 ## Repository layout
 
 ```
@@ -179,6 +198,8 @@ test/
   mocks/                         MockERC20, MockSwapRouter
   fork/                          integration tests against real Arbitrum Morpho Blue,
                                   Bundler3, and GeneralAdapter1
+  audit/                         adversarial tests, one per attack hypothesis, each
+                                  either demonstrating a flaw or proving it is blocked
 ```
 
 ## Testing
