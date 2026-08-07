@@ -36,10 +36,21 @@ abstract contract MorphoPositionValuation is MorphoCore, MorphoMarketRegistry {
             debtValue = MorphoSharesMath.toAssetsUp(borrowShares, totalBorrowAssets, totalBorrowShares);
         }
 
+        // An oracle that reverts must not take the whole vault down with it. Letting it
+        // bubble would make totalAssets() revert, which blocks deposits and withdrawals
+        // for every depositor, including against idle balance that has nothing to do with
+        // this market.
+        //
+        // The fallback treats the collateral as worth nothing rather than skipping the
+        // position. Skipping would drop the debt too, which inflates the reported total
+        // exactly when the vault can least justify it. Valuing collateral at zero while
+        // still counting the debt can only ever under-report, so no one can redeem at a
+        // price the vault cannot substantiate.
         uint256 collateralValue;
         if (collateral > 0) {
-            uint256 price = IOracle(params.oracle).price();
-            collateralValue = MorphoSharesMath.mulDivDown(collateral, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+            try IOracle(params.oracle).price() returns (uint256 price) {
+                collateralValue = MorphoSharesMath.mulDivDown(collateral, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+            } catch {}
         }
 
         // A position can be transiently underwater between a price move and the rebalance
@@ -71,5 +82,19 @@ abstract contract MorphoPositionValuation is MorphoCore, MorphoMarketRegistry {
     function totalMorphoAssets() public view returns (uint256) {
         (uint256 surplus, uint256 shortfall) = _morphoSurplusAndShortfall();
         return surplus > shortfall ? surplus - shortfall : 0;
+    }
+
+    /// @notice Whether this market's oracle is currently answering.
+    /// @dev Valuation degrades silently to a conservative number when an oracle is down, so
+    ///      this is how an operator tells "the position really is worth little" apart from
+    ///      "we cannot currently see what it is worth". Increases and deleverages against
+    ///      the market will revert while this is false, since neither can derive a safe
+    ///      swap floor without a price.
+    function isMarketPriceable(Id id) external view returns (bool) {
+        try IOracle(_marketConfigs[id].params.oracle).price() returns (uint256) {
+            return true;
+        } catch {
+            return false;
+        }
     }
 }

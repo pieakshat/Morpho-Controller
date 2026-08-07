@@ -23,6 +23,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     error InvalidDecreaseAmount(uint256 requested, uint256 available);
     error TargetLeverageNotBelowCurrent(uint256 target, uint256 current);
     error DeleverageAmountTooSmall();
+    error DecreaseAmountTooSmall();
+    error NoPosition(Id id);
+    error PositionHasNoEquity(Id id);
 
     /// @dev Groups _decreasePosition's derived numbers into one struct, passed by memory
     ///      reference between the planning and bundle-building helpers below.
@@ -215,7 +218,12 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             MORPHO.setAuthorization(address(GENERAL_ADAPTER), false);
         }
 
-        if (plan.isFullClose) {
+        // Decided from the resulting on-chain state rather than from the plan's intent. A
+        // decrease can empty a position without having been flagged a full close, and a
+        // market left in the active set costs an oracle call plus two storage reads on
+        // every totalAssets(), which sits on the deposit and withdraw path.
+        (, uint128 sharesAfter, uint128 collateralAfter) = MORPHO.position(id, address(this));
+        if (sharesAfter == 0 && collateralAfter == 0) {
             _markInactive(id);
         }
     }
@@ -227,9 +235,19 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         MORPHO.accrueInterest(params);
         (, uint128 borrowSharesRaw, uint128 collateralRaw) = MORPHO.position(id, address(this));
 
-        plan.isFullClose = requestedAmount == type(uint256).max;
+        require(collateralRaw > 0, NoPosition(id));
+
+        // Asking for exactly the whole balance is the same intent as the max sentinel, so
+        // it takes the same exact-shares path. Routing it through the proportional branch
+        // instead would compute a repay of toAssetsUp(borrowShares), which Morpho converts
+        // back to at least borrowShares and then underflows on — a full exit expressed the
+        // obvious way would revert with nothing explaining why.
+        plan.isFullClose = requestedAmount >= collateralRaw;
         plan.collateralToWithdraw = plan.isFullClose ? uint256(collateralRaw) : requestedAmount;
-        require(plan.collateralToWithdraw <= collateralRaw, InvalidDecreaseAmount(plan.collateralToWithdraw, collateralRaw));
+        require(
+            requestedAmount == type(uint256).max || requestedAmount <= collateralRaw,
+            InvalidDecreaseAmount(requestedAmount, collateralRaw)
+        );
 
         if (borrowSharesRaw > 0) {
             (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = MORPHO.market(id);
@@ -241,6 +259,10 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             } else {
                 uint256 totalDebt = MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares);
                 plan.repayAssets = (totalDebt * plan.collateralToWithdraw) / collateralRaw;
+                // A withdrawal small enough that its share of the debt rounds to zero would
+                // otherwise skip the repay leg entirely and pull collateral out for free,
+                // nudging leverage up on what is supposed to be a proportional decrease.
+                require(plan.repayAssets > 0, DecreaseAmountTooSmall());
                 plan.flashloanAmount = plan.repayAssets;
             }
         }
@@ -268,6 +290,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         // opens should never produce that state, but a silent floor here would hide it
         // instead of surfacing it as the bug it would be.
         uint256 equity = collateralValue - debtValue;
+        // Zero equity means there is no ratio to target: leverage is undefined, and the
+        // division below would panic. Say so rather than surfacing a bare arithmetic error.
+        require(equity > 0, PositionHasNoEquity(id));
         uint256 currentLeverage = (collateralValue * 1e18) / equity;
         require(targetLeverage < currentLeverage, TargetLeverageNotBelowCurrent(targetLeverage, currentLeverage));
 
