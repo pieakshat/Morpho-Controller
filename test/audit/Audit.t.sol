@@ -193,23 +193,31 @@ contract AuditTest is Test {
 
     /// @dev The existing fuzz test bounds withdrawPct to 1..99, never touching the top of
     ///      the range. Scan where the proportional decrease actually stops working.
-    function test_H1_proportionalDecreaseBreaksNearFullWithdrawal() public {
+    /// @dev FIXED. Every size up to and including exactly 100% now works. The 100% case
+    ///      used to revert with a bare arithmetic underflow from inside Morpho, because the
+    ///      proportional repay resolved to more borrow shares than the position held.
+    ///      _planDecrease now routes a full-balance request through the exact-shares path.
+    function test_H1_proportionalDecreaseWorksAtEverySizeIncludingFull() public {
         _openPosition(100_000e6, 2e18);
         (,, uint128 collateral) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
         uint256 snap = vm.snapshotState();
 
-        uint256[8] memory bps = [uint256(9000), 9500, 9900, 9990, 9999, 10000, 10000, 10000];
+        uint256[6] memory bps = [uint256(9000), 9500, 9900, 9990, 9999, 10000];
         for (uint256 i = 0; i < 6; ++i) {
             bool ok = _tryDecrease((uint256(collateral) * bps[i]) / 10_000);
             console2.log("withdraw bps / succeeded:", bps[i], ok);
+            assertTrue(ok, "every withdrawal size should settle");
             vm.revertToState(snap);
         }
 
-        // The exact-100% case is the one a naive allocator would reach for to fully exit
-        // without knowing about the type(uint256).max sentinel.
-        bool fullOk = _tryDecrease(uint256(collateral));
-        console2.log("exact 100% via amount succeeded:", fullOk);
-        assertFalse(fullOk, "exact-100% proportional decrease should be shown to fail");
+        // The exact-100% case is what an allocator naturally reaches for to fully exit
+        // without knowing about the type(uint256).max sentinel. It now behaves identically.
+        _decreaseByAmount(uint256(collateral));
+
+        (, uint128 sharesAfter, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertEq(collateralAfter, 0, "position fully closed");
+        assertEq(sharesAfter, 0, "no dust debt left behind");
+        assertEq(vault.activeMarkets().length, 0, "and the market leaves the active set");
     }
 
     /// @dev The documented full-close path (type(uint256).max) does work, so the failure
@@ -334,9 +342,10 @@ contract AuditTest is Test {
         H4: deleverage against an empty position panics
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev equity is zero when there is no position, so currentLeverage divides by zero.
-    ///      Reverts either way, but with a bare panic rather than a named error.
-    function test_H4_deleverageOnEmptyPositionDividesByZero() public {
+    /// @dev FIXED. Zero equity used to panic with a bare division error. It now names the
+    ///      actual condition, which matters because an allocator seeing this in a batch has
+    ///      no other way to tell it apart from a genuine arithmetic bug.
+    function test_H4_deleverageOnEmptyPositionRevertsWithNamedError() public {
         MarketAction[] memory actions = new MarketAction[](1);
         actions[0] = MarketAction({
             marketId: wstEthMarketId,
@@ -349,7 +358,7 @@ contract AuditTest is Test {
         });
 
         vm.prank(owner);
-        vm.expectRevert(stdError.divisionError);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLeverageEngine.PositionHasNoEquity.selector, wstEthMarketId));
         vault.executeActions(actions);
     }
 
@@ -357,33 +366,41 @@ contract AuditTest is Test {
         H5: oracle failure bricks the whole vault
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev totalAssets() reads every active market's oracle. If one reverts, share
-    ///      conversion reverts, which takes down deposits AND withdrawals of purely idle
-    ///      funds that have nothing to do with that market.
-    function test_H5_revertingOracleBricksDepositsAndWithdrawals() public {
+    /// @dev FIXED. A reverting oracle used to propagate out of totalAssets(), which froze
+    ///      deposits and withdrawals for the whole vault, including 900,000 of idle USDC
+    ///      unrelated to that market. Valuation now degrades to a conservative number
+    ///      instead of reverting.
+    function test_H5_revertingOracleDegradesConservativelyInsteadOfFreezing() public {
         _openPosition(100_000e6, 2e18);
 
         uint256 idle = IERC20(USDC).balanceOf(address(vault));
-        assertGt(idle, 0, "vault holds idle USDC unrelated to the position");
+        (, uint128 shares,) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        (,, uint128 tba, uint128 tbs,,) = IMorpho(MORPHO).market(wstEthMarketId);
+        uint256 debt = MorphoSharesMath.toAssetsUp(shares, tba, tbs);
 
         vm.mockCallRevert(WSTETH_ORACLE, abi.encodeWithSelector(IOracle.price.selector), "ORACLE_DOWN");
 
-        vm.expectRevert();
-        vault.totalAssets();
+        assertFalse(vault.isMarketPriceable(wstEthMarketId), "operator can see the market is unpriceable");
 
+        // Collateral counts for nothing while unpriceable, but the debt still does, so the
+        // report can only be too low, never too high.
+        uint256 reported = vault.totalAssets();
+        console2.log("idle:                  ", idle);
+        console2.log("debt still counted:    ", debt);
+        console2.log("totalAssets() reports: ", reported);
+        assertEq(reported, idle - debt, "collateral valued at zero, debt still subtracted");
+
+        // Both sides of the vault keep working against that conservative price.
         deal(USDC, attacker, 1_000e6);
         vm.startPrank(attacker);
         IERC20(USDC).approve(address(vault), 1_000e6);
-        vm.expectRevert();
         vault.deposit(1_000e6, attacker);
         vm.stopPrank();
 
-        // Even withdrawing idle funds is impossible.
         vm.prank(depositor);
-        vm.expectRevert();
         vault.withdraw(1_000e6, depositor, depositor);
 
-        console2.log("oracle down: idle USDC frozen:", idle);
+        assertEq(IERC20(USDC).balanceOf(depositor), 1_000e6, "idle funds remain accessible");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -532,11 +549,11 @@ contract AuditTest is Test {
         H9: dust decreases skip debt repayment entirely
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev repayAssets = totalDebt * ctw / collateralRaw truncates to zero for small ctw.
-    ///      flashloanAmount then reads as zero, so the whole repay leg is skipped and
-    ///      collateral leaves the position with debt untouched, nudging leverage UP on
-    ///      what is nominally a decrease.
-    function test_H9_dustDecreaseWithdrawsCollateralWithoutRepaying() public {
+    /// @dev FIXED. repayAssets = totalDebt * ctw / collateralRaw truncates to zero for small
+    ///      ctw, which used to skip the repay leg entirely and let collateral leave the
+    ///      position with debt untouched, nudging leverage UP on a nominal decrease. A
+    ///      decrease that would repay nothing is now rejected outright.
+    function test_H9_dustDecreaseIsRejected() public {
         _openPosition(100_000e6, 2e18);
 
         (, uint128 sharesBefore, uint128 collateralBefore) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
@@ -545,17 +562,59 @@ contract AuditTest is Test {
         (,, uint128 tba, uint128 tbs,,) = IMorpho(MORPHO).market(wstEthMarketId);
         uint256 totalDebt = MorphoSharesMath.toAssetsUp(sharesBefore, tba, tbs);
         uint256 freeWithdraw = uint256(collateralBefore) / totalDebt;
-        console2.log("collateral withdrawable with zero repayment:", freeWithdraw);
+        console2.log("collateral that was previously free to withdraw:", freeWithdraw);
 
-        _decreaseByAmount(freeWithdraw);
+        MarketAction[] memory actions = _prepDecrease(freeWithdraw);
+        vm.prank(owner);
+        vm.expectRevert(MorphoLeverageEngine.DecreaseAmountTooSmall.selector);
+        vault.executeActions(actions);
 
         (, uint128 sharesAfter, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
-        console2.log("collateral removed:", uint256(collateralBefore) - uint256(collateralAfter));
-        console2.log("borrow shares before:", uint256(sharesBefore));
-        console2.log("borrow shares after: ", uint256(sharesAfter));
+        assertEq(collateralAfter, collateralBefore, "no collateral left the position");
+        assertEq(sharesAfter, sharesBefore, "and the debt is untouched");
+    }
 
-        assertLt(collateralAfter, collateralBefore, "collateral did leave the position");
-        assertEq(sharesAfter, sharesBefore, "but no debt was repaid at all");
+    /// @dev The rejection must be scoped to genuinely-zero-repay dust, not to small but
+    ///      legitimate decreases.
+    function test_H9b_smallButRealDecreaseStillWorks() public {
+        _openPosition(100_000e6, 2e18);
+        (, uint128 sharesBefore, uint128 collateralBefore) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+
+        _decreaseByAmount(uint256(collateralBefore) / 1_000); // 0.1%
+
+        (, uint128 sharesAfter, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertLt(collateralAfter, collateralBefore, "collateral reduced");
+        assertLt(sharesAfter, sharesBefore, "and debt was actually repaid alongside it");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H13: active-set bookkeeping follows real state
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev FIXED. Deactivation used to key off the plan's isFullClose intent, so a
+    ///      decrease that emptied a position by explicit amount left the market in the
+    ///      active set forever, costing an oracle call and two storage reads on every
+    ///      totalAssets(). It now keys off the resulting on-chain position.
+    function test_H13_emptiedPositionLeavesActiveSetRegardlessOfHowItWasClosed() public {
+        _openPosition(100_000e6, 2e18);
+        assertEq(vault.activeMarkets().length, 1);
+
+        (,, uint128 collateral) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        _decreaseByAmount(uint256(collateral)); // explicit amount, not the max sentinel
+
+        assertEq(vault.activeMarkets().length, 0, "no stale entry left behind");
+        assertEq(vault.totalMorphoAssets(), 0);
+    }
+
+    /// @dev And a position that still exists must stay in the set.
+    function test_H13b_partiallyClosedPositionStaysActive() public {
+        _openPosition(100_000e6, 2e18);
+        (,, uint128 collateral) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+
+        _decreaseByAmount(uint256(collateral) / 2);
+
+        assertEq(vault.activeMarkets().length, 1, "still holding a position, still tracked");
+        assertGt(vault.totalMorphoAssets(), 0);
     }
 
     /*//////////////////////////////////////////////////////////////
