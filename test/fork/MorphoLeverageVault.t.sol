@@ -46,6 +46,9 @@ contract MorphoLeverageVaultForkTest is Test {
     // in this file (up to 5x in the fuzz tests) — actions pick their own leverage per call,
     // this only bounds how high they're allowed to go without the owner raising it.
     uint256 constant MAX_LEVERAGE_CEILING = 10e18;
+    // The mock router fills at exactly the oracle rate, so any non-zero tolerance clears
+    // the engine's oracle floor; 50bps leaves room for the rounding in either direction.
+    uint256 constant SLIPPAGE_BPS = 50;
     uint256 constant DEPOSIT_AMOUNT = 1_000_000e6;
 
     MorphoLeverageVault vault;
@@ -64,12 +67,14 @@ contract MorphoLeverageVaultForkTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envString("ARBITRUM_RPC_URL"), FORK_BLOCK);
 
-        swapExecutor = new MorphoSwapExecutor();
         router = new MockSwapRouter();
 
         vault = new MorphoLeverageVault(
-            IERC20(USDC), owner, IMorpho(MORPHO), IBundler3(BUNDLER3), IGeneralAdapter1(GENERAL_ADAPTER), swapExecutor
+            IERC20(USDC), owner, IMorpho(MORPHO), IBundler3(BUNDLER3), IGeneralAdapter1(GENERAL_ADAPTER)
         );
+        // The vault deploys its own executor now, so it can bind that executor's access
+        // control to itself. Read it back rather than constructing one here.
+        swapExecutor = MorphoSwapExecutor(vault.swapExecutor());
 
         wstEthParams =
             MarketParams({loanToken: USDC, collateralToken: WSTETH, oracle: WSTETH_ORACLE, irm: IRM, lltv: LLTV_86});
@@ -77,8 +82,8 @@ contract MorphoLeverageVaultForkTest is Test {
             MarketParams({loanToken: USDC, collateralToken: WETH, oracle: WETH_ORACLE, irm: IRM, lltv: LLTV_86});
 
         vm.startPrank(owner);
-        wstEthMarketId = vault.registerMarket(wstEthParams, MAX_LEVERAGE_CEILING);
-        wethMarketId = vault.registerMarket(wethParams, MAX_LEVERAGE_CEILING);
+        wstEthMarketId = vault.registerMarket(wstEthParams, MAX_LEVERAGE_CEILING, SLIPPAGE_BPS);
+        wethMarketId = vault.registerMarket(wethParams, MAX_LEVERAGE_CEILING, SLIPPAGE_BPS);
         vm.stopPrank();
 
         // Real ERC4626 deposit, not a raw deal() into the vault — gives us an actual

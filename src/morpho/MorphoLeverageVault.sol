@@ -26,10 +26,25 @@ import {MorphoSwapExecutor} from "./libraries/MorphoSwapExecutor.sol";
 ///      module underneath it.
 contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPositionValuation, MorphoLeverageEngine {
     error NotAllocator();
+    error InvalidDropToleranceBps(uint256 requested, uint256 limit);
+    error TotalAssetsDropped(uint256 before, uint256 current, uint256 floor);
 
     event AllocatorUpdated(address indexed account, bool allowed);
+    event ActionDropToleranceUpdated(uint256 bps);
+
+    /// @dev Ceiling on how permissive the per-call value-loss check can be made.
+    uint256 private constant MAX_DROP_TOLERANCE_BPS = 1_000; // 10%
 
     mapping(address => bool) private _isAllocator;
+
+    /// @notice How much total value a single executeActions call may destroy, in basis
+    ///         points, before it reverts.
+    /// @dev A second layer behind the per-swap oracle floors. Any action is close to
+    ///      value-neutral in principle: an increase converts idle into an equally valuable
+    ///      position, a decrease does the reverse. Each swap is already floor-checked on
+    ///      its own; this catches what still slips through, including losses spread across
+    ///      several actions in one call.
+    uint256 public actionDropToleranceBps = 100; // 1%
 
     /// @dev Owner always has allocator rights too — the allocator role narrows day-to-day
     ///      operational access without ever locking the owner out of their own vault.
@@ -38,18 +53,11 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
         _;
     }
 
-    constructor(
-        IERC20 asset_,
-        address owner_,
-        IMorpho morpho_,
-        IBundler3 bundler3_,
-        IGeneralAdapter1 generalAdapter_,
-        MorphoSwapExecutor swapExecutor_
-    )
+    constructor(IERC20 asset_, address owner_, IMorpho morpho_, IBundler3 bundler3_, IGeneralAdapter1 generalAdapter_)
         ERC20("Morpho Leverage Vault", "mlvUSDC")
         ERC4626(asset_)
         Ownable(owner_)
-        MorphoCore(morpho_, bundler3_, generalAdapter_, swapExecutor_)
+        MorphoCore(morpho_, bundler3_, generalAdapter_)
         MorphoMarketRegistry(address(asset_))
     {}
 
@@ -58,10 +66,19 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     //////////////////////////////////////////////////////////////*/
 
     /// @dev The full picture: idle balance plus every active Morpho position's net value.
-    ///      Drives share pricing — this must be honest, unlike maxWithdraw below which is
-    ///      deliberately conservative.
+    ///      Drives share pricing, so unlike maxWithdraw below (deliberately conservative)
+    ///      this must be honest.
+    ///
+    ///      Nets each position's shortfall (see MorphoPositionValuation) against idle
+    ///      balance rather than flooring it at the position. Idle balance stays
+    ///      withdrawable regardless of what markets are doing, so if a shortfall were
+    ///      dropped instead of netted, the share price would overstate the vault's real
+    ///      value and whoever redeemed first would exit at that stale price, leaving the
+    ///      loss for everyone who waited.
     function totalAssets() public view override returns (uint256) {
-        return IERC20(asset()).balanceOf(address(this)) + totalMorphoAssets();
+        (uint256 surplus, uint256 shortfall) = _morphoSurplusAndShortfall();
+        uint256 gross = IERC20(asset()).balanceOf(address(this)) + surplus;
+        return gross > shortfall ? gross - shortfall : 0;
     }
 
     /// @dev OZ's virtual-offset inflation mitigation, inflating share precision by 10**3
@@ -112,6 +129,8 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     ///         or both in the same call — a decrease on one market can fund an increase on
     ///         another within a single transaction.
     function executeActions(MarketAction[] calldata actions) external onlyAllocator nonReentrant {
+        uint256 assetsBefore = totalAssets();
+
         uint256 length = actions.length;
         for (uint256 i = 0; i < length; ++i) {
             MarketAction calldata action = actions[i];
@@ -121,15 +140,24 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
                 _decreasePosition(action);
             }
         }
+
+        uint256 floor = (assetsBefore * (10_000 - actionDropToleranceBps)) / 10_000;
+        uint256 assetsAfter = totalAssets();
+        require(assetsAfter >= floor, TotalAssetsDropped(assetsBefore, assetsAfter, floor));
     }
 
     /*//////////////////////////////////////////////////////////////
                                 REGISTRY ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Adds `params` to the market whitelist with the given leverage ceiling.
-    function registerMarket(MarketParams calldata params, uint256 maxLeverage) external onlyOwner returns (Id) {
-        return _registerMarket(params, maxLeverage);
+    /// @notice Adds `params` to the market whitelist with the given leverage ceiling and
+    ///         swap slippage tolerance.
+    function registerMarket(MarketParams calldata params, uint256 maxLeverage, uint256 maxSlippageBps)
+        external
+        onlyOwner
+        returns (Id)
+    {
+        return _registerMarket(params, maxLeverage, maxSlippageBps);
     }
 
     /// @notice Enables or disables new increases into an already-registered market.
@@ -140,6 +168,18 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     /// @notice Updates the leverage ceiling an allocator's increases may request.
     function setMaxLeverage(Id id, uint256 maxLeverage) external onlyOwner {
         _setMaxLeverage(id, maxLeverage);
+    }
+
+    /// @notice Updates how far below the oracle price this market's swaps may fill.
+    function setMaxSlippageBps(Id id, uint256 maxSlippageBps) external onlyOwner {
+        _setMaxSlippageBps(id, maxSlippageBps);
+    }
+
+    /// @notice Updates how much value one executeActions call may destroy before reverting.
+    function setActionDropToleranceBps(uint256 bps) external onlyOwner {
+        require(bps <= MAX_DROP_TOLERANCE_BPS, InvalidDropToleranceBps(bps, MAX_DROP_TOLERANCE_BPS));
+        actionDropToleranceBps = bps;
+        emit ActionDropToleranceUpdated(bps);
     }
 
     /// @notice Grants or revokes allocator rights (the ability to call executeActions).

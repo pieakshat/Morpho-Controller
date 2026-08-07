@@ -27,12 +27,7 @@ contract MorphoLeverageVaultAccountingTest is Test {
         asset = new MockERC20("USD Coin", "USDC", 6);
 
         vault = new MorphoLeverageVault(
-            asset,
-            owner,
-            IMorpho(address(0x1111)),
-            IBundler3(address(0x2222)),
-            IGeneralAdapter1(address(0x3333)),
-            MorphoSwapExecutor(address(0x4444))
+            asset, owner, IMorpho(address(0x1111)), IBundler3(address(0x2222)), IGeneralAdapter1(address(0x3333))
         );
     }
 

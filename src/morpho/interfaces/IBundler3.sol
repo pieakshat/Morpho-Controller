@@ -19,4 +19,11 @@ interface IBundler3 {
     /// @notice Executes each Call in `bundle` in order. Reverts the whole bundle unless a
     ///         given Call has skipRevert = true.
     function multicall(Call[] calldata bundle) external payable;
+
+    /// @notice Whoever called multicall() for the bundle currently in flight, or the zero
+    ///         address when no bundle is executing.
+    /// @dev Transient storage on the real deployment, so it is only non-zero for the
+    ///      duration of one transaction's bundle. This is how a callee invoked by Bundler3
+    ///      identifies who actually initiated the bundle, since msg.sender is Bundler3.
+    function initiator() external view returns (address);
 }

@@ -14,13 +14,21 @@ abstract contract MorphoMarketRegistry {
     error MarketAlreadyRegistered(Id id);
     error MarketNotRegistered(Id id);
     error InvalidLeverage();
+    error InvalidSlippageBps(uint256 requested, uint256 limit);
     error LoanTokenMismatch(address expected, address actual);
 
-    event MarketRegistered(Id indexed id, uint256 maxLeverage);
+    event MarketRegistered(Id indexed id, uint256 maxLeverage, uint256 maxSlippageBps);
     event MarketEnabledSet(Id indexed id, bool enabled);
     event MarketMaxLeverageUpdated(Id indexed id, uint256 maxLeverage);
+    event MarketMaxSlippageUpdated(Id indexed id, uint256 maxSlippageBps);
     event MarketActivated(Id indexed id);
     event MarketDeactivated(Id indexed id);
+
+    /// @dev Hard ceiling on how permissive the owner can make a market's slippage floor.
+    ///      The floor is the only thing standing between a compromised allocator and the
+    ///      vault's deployable capital, so it should never be configurable into
+    ///      irrelevance, even by mistake.
+    uint256 internal constant MAX_SLIPPAGE_BPS_LIMIT = 1_000; // 10%
 
     /// @notice The asset this adapter (and its owning vault) is denominated in. Every
     ///         registered market's loanToken must equal this — see _registerMarket.
@@ -52,17 +60,26 @@ abstract contract MorphoMarketRegistry {
 
     /// @notice Adds a new market to the whitelist, enabled by default.
     /// @dev Id is derived from params, not passed in — can't register a mismatched pair.
-    function _registerMarket(MarketParams memory params, uint256 maxLeverage) internal returns (Id id) {
+    function _registerMarket(MarketParams memory params, uint256 maxLeverage, uint256 maxSlippageBps)
+        internal
+        returns (Id id)
+    {
         require(params.loanToken == ASSET, LoanTokenMismatch(ASSET, params.loanToken));
         require(maxLeverage >= 1e18, InvalidLeverage());
+        require(maxSlippageBps <= MAX_SLIPPAGE_BPS_LIMIT, InvalidSlippageBps(maxSlippageBps, MAX_SLIPPAGE_BPS_LIMIT));
         id = _computeId(params);
         require(!_isRegistered[id], MarketAlreadyRegistered(id));
 
         _isRegistered[id] = true;
-        _marketConfigs[id] = MorphoMarketConfig({params: params, maxLeverage: maxLeverage, enabled: true});
+        _marketConfigs[id] = MorphoMarketConfig({
+            params: params,
+            maxLeverage: maxLeverage,
+            maxSlippageBps: maxSlippageBps,
+            enabled: true
+        });
         _registeredMarkets.push(id);
 
-        emit MarketRegistered(id, maxLeverage);
+        emit MarketRegistered(id, maxLeverage, maxSlippageBps);
     }
 
     /// @notice Enables or disables new increases into a market. Does NOT touch existing
@@ -78,6 +95,13 @@ abstract contract MorphoMarketRegistry {
         require(maxLeverage >= 1e18, InvalidLeverage());
         _marketConfigs[id].maxLeverage = maxLeverage;
         emit MarketMaxLeverageUpdated(id, maxLeverage);
+    }
+
+    /// @notice Updates how far below the oracle price this market's swaps may fill.
+    function _setMaxSlippageBps(Id id, uint256 maxSlippageBps) internal onlyRegistered(id) {
+        require(maxSlippageBps <= MAX_SLIPPAGE_BPS_LIMIT, InvalidSlippageBps(maxSlippageBps, MAX_SLIPPAGE_BPS_LIMIT));
+        _marketConfigs[id].maxSlippageBps = maxSlippageBps;
+        emit MarketMaxSlippageUpdated(id, maxSlippageBps);
     }
 
     /*//////////////////////////////////////////////////////////////

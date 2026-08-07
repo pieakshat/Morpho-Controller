@@ -14,6 +14,13 @@ struct MorphoMarketConfig {
     /// @notice Ceiling on the leverage any single increase into this market may request.
     ///         1e18 = no leverage above 1x is ever allowed here.
     uint256 maxLeverage;
+    /// @notice How far below the market oracle's implied price a swap on this market is
+    ///         allowed to fill, in basis points. Bounds what a compromised allocator can
+    ///         extract through a swap venue it controls, since the allocator's own minOut
+    ///         is raised to this floor before the swap runs.
+    /// @dev Per market rather than global because tolerable slippage is a property of the
+    ///      pair's real liquidity.
+    uint256 maxSlippageBps;
     /// @notice The whitelist gate — the allocator can only act on a market where this is true.
     bool enabled;
 }

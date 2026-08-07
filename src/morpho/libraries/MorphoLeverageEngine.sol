@@ -31,7 +31,21 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         uint256 repayAssets;
         uint256 repayShares;
         uint256 flashloanAmount;
+        uint256 minSwapOut;
         bool isFullClose;
+    }
+
+    /// @dev Raises the caller's requested minOut to the market oracle's implied output
+    ///      less the market's tolerated slippage. The allocator picks both the swap venue
+    ///      and its own minOut, so its number alone bounds nothing; this is what actually
+    ///      caps how much a swap can under-deliver relative to a price the vault trusts.
+    function _effectiveMinOut(uint256 oracleExpectedOut, uint256 maxSlippageBps, uint256 requestedMinOut)
+        private
+        pure
+        returns (uint256)
+    {
+        uint256 floor = (oracleExpectedOut * (10_000 - maxSlippageBps)) / 10_000;
+        return requestedMinOut > floor ? requestedMinOut : floor;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -52,23 +66,45 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         require(isMarketEnabled(id), MarketNotEnabled(id));
 
         MorphoMarketConfig memory config = _marketConfigs[id];
-        MarketParams memory params = config.params;
+        require(action.leverage >= 1e18, LeverageBelowOneX(action.leverage));
+        require(action.leverage <= config.maxLeverage, LeverageExceedsMax(action.leverage, config.maxLeverage));
 
-        uint256 leverage = action.leverage;
-        require(leverage >= 1e18, LeverageBelowOneX(leverage));
-        require(leverage <= config.maxLeverage, LeverageExceedsMax(leverage, config.maxLeverage));
+        uint256 totalAmount = (action.amount * action.leverage) / 1e18;
 
-        uint256 ownAmount = action.amount;
-        uint256 totalAmount = (ownAmount * leverage) / 1e18;
-        uint256 borrowAmount = totalAmount - ownAmount;
+        // loanToken -> collateralToken, so the oracle's collateral-per-loan-token rate is
+        // the inverse of the price it quotes.
+        uint256 minSwapOut = _effectiveMinOut(
+            MorphoSharesMath.mulDivDown(
+                totalAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, IOracle(config.params.oracle).price()
+            ),
+            config.maxSlippageBps,
+            action.minOut
+        );
 
         // Plain transfer rather than a bundled Call: inside a bundle a Call here would
         // execute as Bundler3, which holds nothing, instead of this adapter.
-        IERC20(params.loanToken).safeTransfer(address(GENERAL_ADAPTER), ownAmount);
+        IERC20(config.params.loanToken).safeTransfer(address(GENERAL_ADAPTER), action.amount);
 
+        _flashloanAndExecute(
+            config.params.loanToken,
+            totalAmount,
+            _buildIncreaseBundle(config.params, totalAmount, totalAmount - action.amount, minSwapOut, action)
+        );
+        _markActive(id);
+    }
+
+    /// @dev Builds the nested Call[] for an increase: move the borrowed loanToken to the
+    ///      swap executor, swap it for collateral, supply all of it, then borrow against it.
+    function _buildIncreaseBundle(
+        MarketParams memory params,
+        uint256 totalAmount,
+        uint256 borrowAmount,
+        uint256 minSwapOut,
+        MarketAction memory action
+    ) private view returns (Call[] memory nested) {
         // Morpho's borrow() reverts if both `assets` and `shares` are zero, so the borrow
         // step is omitted entirely at 1x rather than called with borrowAmount = 0.
-        Call[] memory nested = new Call[](borrowAmount > 0 ? 4 : 3);
+        nested = new Call[](borrowAmount > 0 ? 4 : 3);
         uint256 i;
         nested[i++] = Call({
             to: address(GENERAL_ADAPTER),
@@ -84,7 +120,7 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                 (
                     IERC20(params.loanToken),
                     IERC20(params.collateralToken),
-                    action.minOut,
+                    minSwapOut,
                     action.swapTarget,
                     action.swapCalldata,
                     address(GENERAL_ADAPTER)
@@ -112,9 +148,6 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                 callbackHash: bytes32(0)
             });
         }
-
-        _flashloanAndExecute(params.loanToken, totalAmount, nested);
-        _markActive(id);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -150,6 +183,17 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
 
         DecreasePlan memory plan =
             action.leverage > 0 ? _planDeleverage(id, action.leverage) : _planDecrease(id, action.amount);
+
+        // collateralToken -> loanToken, the opposite direction from an increase, so here
+        // the oracle price applies directly rather than inverted.
+        plan.minSwapOut = _effectiveMinOut(
+            MorphoSharesMath.mulDivDown(
+                plan.collateralToWithdraw, IOracle(params.oracle).price(), MorphoSharesMath.ORACLE_PRICE_SCALE
+            ),
+            _marketConfigs[id].maxSlippageBps,
+            action.minOut
+        );
+
         Call[] memory nested = _buildDecreaseBundle(params, plan, action);
 
         if (plan.flashloanAmount > 0) {
@@ -220,9 +264,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             ? MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares)
             : 0;
 
-        // Underflows (reverting) if the position is already underwater — collateral no
-        // longer covers debt, a state this engine's own health-respecting opens should
-        // never produce, but not something to silently paper over here either.
+        // Underflows and reverts if collateral no longer covers debt. This engine's own
+        // opens should never produce that state, but a silent floor here would hide it
+        // instead of surfacing it as the bug it would be.
         uint256 equity = collateralValue - debtValue;
         uint256 currentLeverage = (collateralValue * 1e18) / equity;
         require(targetLeverage < currentLeverage, TargetLeverageNotBelowCurrent(targetLeverage, currentLeverage));
@@ -307,7 +351,7 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                 (
                     IERC20(params.collateralToken),
                     IERC20(params.loanToken),
-                    action.minOut,
+                    plan.minSwapOut,
                     action.swapTarget,
                     action.swapCalldata,
                     plan.flashloanAmount > 0 ? address(GENERAL_ADAPTER) : address(this)

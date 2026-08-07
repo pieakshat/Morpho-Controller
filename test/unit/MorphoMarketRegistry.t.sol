@@ -21,6 +21,8 @@ contract MorphoMarketRegistryTest is Test {
     MockERC20 asset;
     MockERC20 otherAsset;
 
+    uint256 constant SLIPPAGE_BPS = 50;
+
     address owner = makeAddr("owner");
     address stranger = makeAddr("stranger");
 
@@ -29,12 +31,7 @@ contract MorphoMarketRegistryTest is Test {
         otherAsset = new MockERC20("Other", "OTH", 18);
 
         vault = new MorphoLeverageVault(
-            asset,
-            owner,
-            IMorpho(address(0x1111)),
-            IBundler3(address(0x2222)),
-            IGeneralAdapter1(address(0x3333)),
-            MorphoSwapExecutor(address(0x4444))
+            asset, owner, IMorpho(address(0x1111)), IBundler3(address(0x2222)), IGeneralAdapter1(address(0x3333))
         );
     }
 
@@ -56,7 +53,7 @@ contract MorphoMarketRegistryTest is Test {
         MarketParams memory params = _params(address(0xC01));
 
         vm.prank(owner);
-        Id id = vault.registerMarket(params, 2e18);
+        Id id = vault.registerMarket(params, 2e18, SLIPPAGE_BPS);
 
         assertTrue(vault.isMarketEnabled(id));
         assertEq(vault.marketConfig(id).maxLeverage, 2e18);
@@ -66,10 +63,10 @@ contract MorphoMarketRegistryTest is Test {
         MarketParams memory params = _params(address(0xC01));
 
         vm.startPrank(owner);
-        Id id = vault.registerMarket(params, 2e18);
+        Id id = vault.registerMarket(params, 2e18, SLIPPAGE_BPS);
 
         vm.expectRevert(abi.encodeWithSelector(MorphoMarketRegistry.MarketAlreadyRegistered.selector, id));
-        vault.registerMarket(params, 2e18);
+        vault.registerMarket(params, 2e18, SLIPPAGE_BPS);
         vm.stopPrank();
     }
 
@@ -78,7 +75,7 @@ contract MorphoMarketRegistryTest is Test {
 
         vm.prank(owner);
         vm.expectRevert(MorphoMarketRegistry.InvalidLeverage.selector);
-        vault.registerMarket(params, 1e18 - 1);
+        vault.registerMarket(params, 1e18 - 1, SLIPPAGE_BPS);
     }
 
     function test_registerMarket_revertsOnLoanTokenMismatch() public {
@@ -89,13 +86,13 @@ contract MorphoMarketRegistryTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(MorphoMarketRegistry.LoanTokenMismatch.selector, address(asset), address(otherAsset))
         );
-        vault.registerMarket(params, 2e18);
+        vault.registerMarket(params, 2e18, SLIPPAGE_BPS);
     }
 
     function test_registerMarket_onlyOwner() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        vault.registerMarket(_params(address(0xC01)), 2e18);
+        vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -104,7 +101,7 @@ contract MorphoMarketRegistryTest is Test {
 
     function test_setMarketEnabled_togglesAndReverts_onUnregistered() public {
         vm.startPrank(owner);
-        Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
+        Id id = vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
         assertTrue(vault.isMarketEnabled(id));
 
         vault.setMarketEnabled(id, false);
@@ -122,7 +119,7 @@ contract MorphoMarketRegistryTest is Test {
 
     function test_setMarketEnabled_onlyOwner() public {
         vm.prank(owner);
-        Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
+        Id id = vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
@@ -135,7 +132,7 @@ contract MorphoMarketRegistryTest is Test {
 
     function test_setMaxLeverage_updatesAndRevertsOnInvalid() public {
         vm.startPrank(owner);
-        Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
+        Id id = vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
 
         vault.setMaxLeverage(id, 3e18);
         assertEq(vault.marketConfig(id).maxLeverage, 3e18);
@@ -147,7 +144,7 @@ contract MorphoMarketRegistryTest is Test {
 
     function test_setMaxLeverage_onlyOwner() public {
         vm.prank(owner);
-        Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
+        Id id = vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
@@ -160,8 +157,8 @@ contract MorphoMarketRegistryTest is Test {
 
     function test_registeredMarkets_and_activeMarkets_returnCorrectArrays() public {
         vm.startPrank(owner);
-        Id id1 = vault.registerMarket(_params(address(0xC01)), 2e18);
-        Id id2 = vault.registerMarket(_params(address(0xC02)), 3e18);
+        Id id1 = vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
+        Id id2 = vault.registerMarket(_params(address(0xC02)), 3e18, SLIPPAGE_BPS);
         vm.stopPrank();
 
         Id[] memory registered = vault.registeredMarkets();
@@ -206,7 +203,7 @@ contract MorphoMarketRegistryTest is Test {
             MarketParams({loanToken: address(asset), collateralToken: collateralToken, oracle: oracle, irm: irm, lltv: lltv});
 
         vm.prank(owner);
-        Id id = vault.registerMarket(params, leverage);
+        Id id = vault.registerMarket(params, leverage, SLIPPAGE_BPS);
 
         assertTrue(vault.isMarketEnabled(id));
         assertEq(vault.marketConfig(id).maxLeverage, leverage);
@@ -217,14 +214,14 @@ contract MorphoMarketRegistryTest is Test {
 
         vm.prank(owner);
         vm.expectRevert(MorphoMarketRegistry.InvalidLeverage.selector);
-        vault.registerMarket(_params(address(0xC01)), leverage);
+        vault.registerMarket(_params(address(0xC01)), leverage, SLIPPAGE_BPS);
     }
 
     function testFuzz_setMaxLeverage_revertsForAnyInvalidLeverage(uint256 newLeverage) public {
         newLeverage = bound(newLeverage, 0, 1e18 - 1);
 
         vm.startPrank(owner);
-        Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
+        Id id = vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
 
         vm.expectRevert(MorphoMarketRegistry.InvalidLeverage.selector);
         vault.setMaxLeverage(id, newLeverage);
@@ -237,14 +234,14 @@ contract MorphoMarketRegistryTest is Test {
 
         vm.startPrank(caller);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, caller));
-        vault.registerMarket(_params(address(0xC01)), 2e18);
+        vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
 
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, caller));
         vault.setAllocator(caller, true);
         vm.stopPrank();
 
         vm.prank(owner);
-        Id id = vault.registerMarket(_params(address(0xC01)), 2e18);
+        Id id = vault.registerMarket(_params(address(0xC01)), 2e18, SLIPPAGE_BPS);
 
         vm.startPrank(caller);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, caller));

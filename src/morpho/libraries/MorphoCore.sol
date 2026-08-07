@@ -13,15 +13,19 @@ abstract contract MorphoCore {
     IGeneralAdapter1 internal immutable GENERAL_ADAPTER;
     MorphoSwapExecutor internal immutable SWAP_EXECUTOR;
 
-    constructor(
-        IMorpho morpho_,
-        IBundler3 bundler3_,
-        IGeneralAdapter1 generalAdapter_,
-        MorphoSwapExecutor swapExecutor_
-    ) {
+    /// @dev The swap executor is deployed here rather than passed in, which makes it
+    ///      structurally impossible for two vaults to share one. The executor reads its
+    ///      authorized vault from its deployer, so constructing it here is also what
+    ///      binds its access control to this vault.
+    constructor(IMorpho morpho_, IBundler3 bundler3_, IGeneralAdapter1 generalAdapter_) {
         MORPHO = morpho_;
         BUNDLER3 = bundler3_;
         GENERAL_ADAPTER = generalAdapter_;
-        SWAP_EXECUTOR = swapExecutor_;
+        SWAP_EXECUTOR = new MorphoSwapExecutor(bundler3_);
+    }
+
+    /// @notice The dedicated swap executor this vault routes every swap leg through.
+    function swapExecutor() external view returns (address) {
+        return address(SWAP_EXECUTOR);
     }
 }
