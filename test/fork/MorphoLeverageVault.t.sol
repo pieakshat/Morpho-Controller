@@ -11,6 +11,7 @@ import {IOracle} from "../../src/morpho/interfaces/IOracle.sol";
 import {MarketAction} from "../../src/morpho/types/MorphoTypes.sol";
 import {MorphoSharesMath} from "../../src/morpho/libraries/MorphoSharesMath.sol";
 import {MorphoSwapExecutor} from "../../src/morpho/libraries/MorphoSwapExecutor.sol";
+import {CircuitBreaker} from "../../src/morpho/libraries/CircuitBreaker.sol";
 import {MorphoLeverageEngine} from "../../src/morpho/libraries/MorphoLeverageEngine.sol";
 import {MorphoLeverageVault} from "../../src/morpho/MorphoLeverageVault.sol";
 import {MockSwapRouter} from "../mocks/MockSwapRouter.sol";
@@ -847,5 +848,63 @@ contract MorphoLeverageVaultForkTest is Test {
             IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
         );
         assertEq(vault.activeMarkets().length, 1, "partial decrease should never deactivate the market");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              CIRCUIT BREAKER
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev emergencyDecrease must survive exactly the scenario it exists for: the breaker
+    ///      paused and a market's rate limit already exhausted, both of which would block a
+    ///      normal allocator action -- see MorphoLeverageEngine._emergencyDecreasePosition.
+    function test_emergencyDecrease_worksWhilePausedAndRateLimited() public {
+        _openPosition(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6);
+
+        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        vm.startPrank(owner);
+        vault.setBreakerPaused(true);
+        breaker.setMaxExposureChangePerWindow(wstEthMarketId, 1); // exhausted by anything real
+        vm.stopPrank();
+
+        // Confirm a normal allocator increase is actually blocked, not just theoretically.
+        uint256 ownAmount = 1_000e6;
+        (bytes memory increaseData, uint256 increaseOut) =
+            _buildIncreaseSwap(WSTETH, WSTETH_ORACLE, (ownAmount * LEVERAGE_2X) / 1e18);
+        MarketAction[] memory increaseActions = new MarketAction[](1);
+        increaseActions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: ownAmount,
+            leverage: LEVERAGE_2X,
+            minOut: increaseOut,
+            swapTarget: address(router),
+            swapCalldata: increaseData
+        });
+        vm.prank(owner);
+        vm.expectRevert(CircuitBreaker.Paused.selector);
+        vault.executeActions(increaseActions);
+
+        // The owner's emergency exit still works, bypassing the breaker entirely.
+        (,, uint128 collateralBefore) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        uint256 withdrawAmount = uint256(collateralBefore) / 2;
+        (bytes memory decreaseData, uint256 decreaseOut) = _buildDecreaseSwap(WSTETH, WSTETH_ORACLE, withdrawAmount);
+
+        MarketAction memory emergencyAction = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: false,
+            amount: withdrawAmount,
+            leverage: 0,
+            minOut: decreaseOut,
+            swapTarget: address(router),
+            swapCalldata: decreaseData
+        });
+
+        vm.prank(owner);
+        vault.emergencyDecrease(emergencyAction);
+
+        (,, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertEq(
+            collateralAfter, collateralBefore - withdrawAmount, "emergency decrease succeeded despite pause + rate limit"
+        );
     }
 }

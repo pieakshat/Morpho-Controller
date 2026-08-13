@@ -25,6 +25,20 @@ struct MorphoMarketConfig {
     bool enabled;
 }
 
+/// @dev Bundles the values CircuitBreaker's increase hooks need, the same way DecreasePlan
+///      bundles _decreasePosition's derived numbers — avoids stack-too-deep from passing
+///      six separate params to two different hook calls, and lets checkBeforeIncrease and
+///      checkAfterIncrease share the exact same price/slippage numbers the engine itself
+///      just used, rather than each hook re-deriving them.
+struct IncreaseCheckParams {
+    Id marketId;
+    MarketParams params;
+    uint256 leverage;
+    uint256 totalAmount;
+    uint256 price;
+    uint256 slippageBpsUsed;
+}
+
 /// @notice One instruction within a rebalance call, touching exactly one market.
 /// @dev Flat and typed on purpose — this is one self-contained system, so there's no
 ///      reason to nest abi.encode calls inside opaque bytes just to cross a module boundary.

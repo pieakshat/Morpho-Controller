@@ -6,7 +6,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Id, MarketParams} from "../interfaces/IMorpho.sol";
 import {Call} from "../interfaces/IBundler3.sol";
 import {IOracle} from "../interfaces/IOracle.sol";
-import {MorphoMarketConfig, MarketAction} from "../types/MorphoTypes.sol";
+import {MorphoMarketConfig, MarketAction, IncreaseCheckParams} from "../types/MorphoTypes.sol";
 import {MorphoSharesMath} from "./MorphoSharesMath.sol";
 import {MorphoSwapExecutor} from "./MorphoSwapExecutor.sol";
 import {MorphoCore} from "./MorphoCore.sol";
@@ -73,16 +73,28 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         require(action.leverage <= config.maxLeverage, LeverageExceedsMax(action.leverage, config.maxLeverage));
 
         uint256 totalAmount = (action.amount * action.leverage) / 1e18;
+        uint256 price = IOracle(config.params.oracle).price();
 
         // loanToken -> collateralToken, so the oracle's collateral-per-loan-token rate is
         // the inverse of the price it quotes.
         uint256 minSwapOut = _effectiveMinOut(
-            MorphoSharesMath.mulDivDown(
-                totalAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, IOracle(config.params.oracle).price()
-            ),
+            MorphoSharesMath.mulDivDown(totalAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price),
             config.maxSlippageBps,
             action.minOut
         );
+
+        // Built once and reused for both hook calls below: same memory pointer either way,
+        // so passing it twice costs nothing extra and can't let the two checks disagree on
+        // what this action actually was.
+        IncreaseCheckParams memory checkParams = IncreaseCheckParams({
+            marketId: id,
+            params: config.params,
+            leverage: action.leverage,
+            totalAmount: totalAmount,
+            price: price,
+            slippageBpsUsed: config.maxSlippageBps
+        });
+        CIRCUIT_BREAKER.checkBeforeIncrease(checkParams);
 
         // Plain transfer rather than a bundled Call: inside a bundle a Call here would
         // execute as Bundler3, which holds nothing, instead of this adapter.
@@ -94,6 +106,8 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             _buildIncreaseBundle(config.params, totalAmount, totalAmount - action.amount, minSwapOut, action)
         );
         _markActive(id);
+
+        CIRCUIT_BREAKER.checkAfterIncrease(checkParams);
     }
 
     /// @dev Builds the nested Call[] for an increase: move the borrowed loanToken to the
@@ -180,6 +194,20 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     ///      bad fill reverts cleanly in the swap executor instead of failing later when
     ///      the flashloan can't be covered.
     function _decreasePosition(MarketAction memory action) internal {
+        uint256 unwoundValue = _decreasePositionCore(action);
+        CIRCUIT_BREAKER.checkAfterDecrease(action.marketId, unwoundValue);
+    }
+
+    /// @dev Same as _decreasePosition but skips CIRCUIT_BREAKER entirely — used only by
+    ///      MorphoLeverageVault.emergencyDecrease. checkAfterDecrease can't revert on its
+    ///      current happy path, but an emergency exit's whole job is to survive scenarios
+    ///      other assumptions have broken in; it must not depend on CircuitBreaker being
+    ///      alive and well, not just on its checks passing.
+    function _emergencyDecreasePosition(MarketAction memory action) internal {
+        _decreasePositionCore(action);
+    }
+
+    function _decreasePositionCore(MarketAction memory action) private returns (uint256 unwoundValue) {
         Id id = action.marketId;
         require(_isRegistered[id], MarketNotRegistered(id));
         MarketParams memory params = _marketConfigs[id].params;
@@ -188,14 +216,12 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             action.leverage > 0 ? _planDeleverage(id, action.leverage) : _planDecrease(id, action.amount);
 
         // collateralToken -> loanToken, the opposite direction from an increase, so here
-        // the oracle price applies directly rather than inverted.
-        plan.minSwapOut = _effectiveMinOut(
-            MorphoSharesMath.mulDivDown(
-                plan.collateralToWithdraw, IOracle(params.oracle).price(), MorphoSharesMath.ORACLE_PRICE_SCALE
-            ),
-            _marketConfigs[id].maxSlippageBps,
-            action.minOut
+        // the oracle price applies directly rather than inverted. Also what CircuitBreaker
+        // sees as this action's exposure change, via checkAfterDecrease above.
+        unwoundValue = MorphoSharesMath.mulDivDown(
+            plan.collateralToWithdraw, IOracle(params.oracle).price(), MorphoSharesMath.ORACLE_PRICE_SCALE
         );
+        plan.minSwapOut = _effectiveMinOut(unwoundValue, _marketConfigs[id].maxSlippageBps, action.minOut);
 
         Call[] memory nested = _buildDecreaseBundle(params, plan, action);
 

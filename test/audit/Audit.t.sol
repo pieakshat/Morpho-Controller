@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test, stdError} from "forge-std/Test.sol";
 import {console2} from "forge-std/console2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {IMorpho, Id, MarketParams} from "../../src/morpho/interfaces/IMorpho.sol";
 import {IBundler3} from "../../src/morpho/interfaces/IBundler3.sol";
@@ -12,6 +13,7 @@ import {IOracle} from "../../src/morpho/interfaces/IOracle.sol";
 import {MarketAction} from "../../src/morpho/types/MorphoTypes.sol";
 import {MorphoSharesMath} from "../../src/morpho/libraries/MorphoSharesMath.sol";
 import {MorphoSwapExecutor} from "../../src/morpho/libraries/MorphoSwapExecutor.sol";
+import {CircuitBreaker} from "../../src/morpho/libraries/CircuitBreaker.sol";
 import {MorphoLeverageEngine} from "../../src/morpho/libraries/MorphoLeverageEngine.sol";
 import {MorphoLeverageVault} from "../../src/morpho/MorphoLeverageVault.sol";
 import {MockSwapRouter} from "../mocks/MockSwapRouter.sol";
@@ -75,6 +77,8 @@ contract AuditTest is Test {
     address constant USDC = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831;
     address constant WSTETH = 0x5979D7b546E38E414F7E9822514be443A4800529;
     address constant WSTETH_ORACLE = 0x8e02a9b9Cc29d783b2fCB71C3a72651B591cae31;
+    address constant WETH = 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1;
+    address constant WETH_ORACLE = 0x282FEB10549fde52bD61A6979424Ddf18A4971A2;
     address constant IRM = 0x66F30587FB8D4206918deb78ecA7d5eBbafD06DA;
     uint256 constant LLTV_86 = 0.86e18;
     uint256 constant FORK_BLOCK = 491_260_000;
@@ -701,5 +705,234 @@ contract AuditTest is Test {
 
         assertEq(vault.totalAssets(), 0, "insolvent vault reports zero, not a revert");
         assertEq(vault.totalMorphoAssets(), 0);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H14: allocator cannot exceed the circuit breaker's aggregate debt cap
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev maxAggregateDebt caps total debt across every active market in ASSET terms,
+    ///      independent of any single market's own leverage ceiling.
+    function test_H14_allocatorCannotExceedAggregateDebtCap() public {
+        uint256 ownAmount = 100_000e6;
+        uint256 leverage = 2e18;
+        uint256 totalAmount = (ownAmount * leverage) / 1e18;
+        uint256 price = IOracle(WSTETH_ORACLE).price();
+        uint256 rate = 1e54 / price;
+        router.setRate(rate);
+        uint256 collateralOut = (totalAmount * rate) / 1e18;
+        deal(WSTETH, address(router), collateralOut);
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: ownAmount,
+            leverage: leverage,
+            minOut: collateralOut,
+            swapTarget: address(router),
+            swapCalldata: abi.encodeCall(MockSwapRouter.swap, (IERC20(USDC), IERC20(WSTETH), totalAmount))
+        });
+
+        // Built manually rather than via _openPosition: that helper's own oracle staticcall
+        // (to size the swap) would otherwise be "the next call" vm.expectRevert() catches,
+        // since it runs before _openPosition ever reaches vault.executeActions.
+        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        vm.prank(owner);
+        breaker.setMaxAggregateDebt(ownAmount / 2); // half of what this action's borrow will be
+
+        vm.prank(owner);
+        vm.expectRevert(); // MaxAggregateDebtExceeded
+        vault.executeActions(actions);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H15: pausing the breaker blocks increases, leaves decreases working
+    //////////////////////////////////////////////////////////////*/
+
+    function test_H15_pauseBlocksIncreasesLeavesDecreasesWorking() public {
+        _openPosition(100_000e6, 2e18);
+
+        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        vm.prank(owner);
+        breaker.setPaused(true);
+
+        _decreaseByAmount(1_000e6); // unaffected by pause
+
+        // Built manually rather than via _openPosition -- see the comment in H14 above.
+        uint256 ownAmount = 10_000e6;
+        uint256 leverage = 2e18;
+        uint256 totalAmount = (ownAmount * leverage) / 1e18;
+        uint256 price = IOracle(WSTETH_ORACLE).price();
+        uint256 rate = 1e54 / price;
+        router.setRate(rate);
+        uint256 collateralOut = (totalAmount * rate) / 1e18;
+        deal(WSTETH, address(router), collateralOut);
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: ownAmount,
+            leverage: leverage,
+            minOut: collateralOut,
+            swapTarget: address(router),
+            swapCalldata: abi.encodeCall(MockSwapRouter.swap, (IERC20(USDC), IERC20(WSTETH), totalAmount))
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(CircuitBreaker.Paused.selector);
+        vault.executeActions(actions);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H16: only the owner can trigger emergencyDecrease
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev emergencyDecrease bypasses the allocator role and the circuit breaker entirely,
+    ///      so it must be reachable by the owner alone -- not the allocator, not anyone else.
+    function test_H16_emergencyDecreaseIsOwnerOnly() public {
+        _openPosition(100_000e6, 2e18);
+        (,, uint128 collateralRaw) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        uint256 withdrawAmount = uint256(collateralRaw) / 2;
+
+        uint256 price = IOracle(WSTETH_ORACLE).price();
+        uint256 rate = price / 1e18;
+        router.setRate(rate);
+        uint256 expectedOut = (withdrawAmount * rate) / 1e18;
+        deal(USDC, address(router), expectedOut);
+
+        MarketAction memory action = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: false,
+            amount: withdrawAmount,
+            leverage: 0,
+            minOut: expectedOut,
+            swapTarget: address(router),
+            swapCalldata: abi.encodeCall(MockSwapRouter.swap, (IERC20(WSTETH), IERC20(USDC), withdrawAmount))
+        });
+
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        vault.emergencyDecrease(action);
+
+        vm.prank(owner);
+        vault.emergencyDecrease(action);
+
+        (,, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertEq(collateralAfter, collateralRaw - withdrawAmount, "owner's emergency decrease succeeded");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H17: a broken oracle on one active market must not brick increases into another
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Regression test for CircuitBreaker._checkAggregateAndAssetExposure's try/catch:
+    ///      without it, one bad oracle on any active market would block every future
+    ///      increase into every market, not just the affected one.
+    function test_H17_brokenOracleOnUnrelatedMarketDoesNotBrickHealthyIncrease() public {
+        MarketParams memory wethParams =
+            MarketParams({loanToken: USDC, collateralToken: WETH, oracle: WETH_ORACLE, irm: IRM, lltv: LLTV_86});
+
+        vm.startPrank(owner);
+        Id wethMarketId = vault.registerMarket(wethParams, MAX_LEVERAGE_CEILING, SLIPPAGE_BPS);
+        // Nonzero so the aggregate loop actually inspects wethMarketId's oracle below,
+        // rather than short-circuiting because no exposure cap is configured at all.
+        CircuitBreaker(vault.circuitBreaker()).setMaxAssetExposure(WETH, type(uint256).max);
+        vm.stopPrank();
+
+        uint256 wethOwn = 10_000e6;
+        uint256 wethTotal = wethOwn * 2;
+        uint256 wethPrice = IOracle(WETH_ORACLE).price();
+        uint256 wethRate = 1e54 / wethPrice;
+        router.setRate(wethRate);
+        uint256 wethOut = (wethTotal * wethRate) / 1e18;
+        deal(WETH, address(router), wethOut);
+
+        MarketAction[] memory wethActions = new MarketAction[](1);
+        wethActions[0] = MarketAction({
+            marketId: wethMarketId,
+            isIncrease: true,
+            amount: wethOwn,
+            leverage: 2e18,
+            minOut: wethOut,
+            swapTarget: address(router),
+            swapCalldata: abi.encodeCall(MockSwapRouter.swap, (IERC20(USDC), IERC20(WETH), wethTotal))
+        });
+        vm.prank(owner);
+        vault.executeActions(wethActions);
+
+        vm.mockCallRevert(WETH_ORACLE, abi.encodeWithSelector(IOracle.price.selector), "ORACLE_DOWN");
+
+        _openPosition(50_000e6, 2e18); // must not revert despite WETH's oracle being down
+        assertEq(vault.activeMarkets().length, 2, "both positions remain active");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H18: ownership transfer carries breaker admin with no separate step
+    //////////////////////////////////////////////////////////////*/
+
+    function test_H18_ownershipTransferCarriesBreakerAdminWithNoSeparateStep() public {
+        address newOwner = makeAddr("newOwner");
+        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+
+        vm.prank(owner);
+        vault.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        vault.acceptOwnership();
+
+        vm.prank(owner);
+        vm.expectRevert(CircuitBreaker.NotVaultOwner.selector);
+        breaker.setPaused(true);
+
+        vm.prank(newOwner);
+        breaker.setPaused(true);
+        assertTrue(breaker.paused());
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        H19: price-deviation is a spot-price sanity check, not a manipulation-proof defense
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Confirms the check does what it claims (catch a gross same-block price jump).
+    ///      What it does NOT claim: an attacker moving the spot price by less than the
+    ///      configured bps, or across several separate calls, is not caught by this check
+    ///      alone -- see MorphoPositionValuation for how the vault handles a price that
+    ///      later turns out to have been wrong (nets the shortfall, doesn't prevent it).
+    function test_H19_priceDeviationCatchesAGrossSpikeButIsOnlyASanityCheck() public {
+        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        vm.prank(owner);
+        breaker.setMaxPriceDeviationBps(wstEthMarketId, 500); // 5%
+
+        _openPosition(1_000e6, 1.5e18); // seeds a baseline observation
+        uint256 baseline = breaker.lastObservedPrice(wstEthMarketId);
+        console2.log("baseline observed price:", baseline);
+
+        uint256 spiked = baseline * 2;
+        vm.mockCall(WSTETH_ORACLE, abi.encodeWithSelector(IOracle.price.selector), abi.encode(spiked));
+
+        // Built manually rather than via _openPosition -- see the comment in H14 above.
+        uint256 ownAmount = 1_000e6;
+        uint256 leverage = 1.5e18;
+        uint256 totalAmount = (ownAmount * leverage) / 1e18;
+        uint256 rate = 1e54 / spiked;
+        router.setRate(rate);
+        uint256 collateralOut = (totalAmount * rate) / 1e18;
+        deal(WSTETH, address(router), collateralOut);
+
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: ownAmount,
+            leverage: leverage,
+            minOut: collateralOut,
+            swapTarget: address(router),
+            swapCalldata: abi.encodeCall(MockSwapRouter.swap, (IERC20(USDC), IERC20(WSTETH), totalAmount))
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(); // PriceDeviationExceeded
+        vault.executeActions(actions);
     }
 }

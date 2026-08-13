@@ -147,6 +147,19 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     }
 
     /*//////////////////////////////////////////////////////////////
+                                 EMERGENCY
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Force-unwinds a position, bypassing the allocator role and the circuit
+    ///         breaker entirely. The last resort if the allocator is compromised, stuck, or
+    ///         a breaker threshold is itself misconfigured and blocking a real exit — see
+    ///         MorphoLeverageEngine._emergencyDecreasePosition for why the breaker is
+    ///         skipped rather than just satisfied.
+    function emergencyDecrease(MarketAction calldata action) external onlyOwner nonReentrant {
+        _emergencyDecreasePosition(action);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                                 REGISTRY ADMIN
     //////////////////////////////////////////////////////////////*/
 
@@ -191,5 +204,15 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     /// @notice Returns whether `account` currently holds allocator rights.
     function isAllocator(address account) external view returns (bool) {
         return _isAllocator[account];
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            CIRCUIT BREAKER ADMIN
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Pauses or unpauses new increases across every market. Decreases and
+    ///         emergencyDecrease are unaffected either way.
+    function setBreakerPaused(bool paused_) external onlyOwner {
+        CIRCUIT_BREAKER.setPaused(paused_);
     }
 }
