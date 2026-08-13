@@ -205,14 +205,4 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
     function isAllocator(address account) external view returns (bool) {
         return _isAllocator[account];
     }
-
-    /*//////////////////////////////////////////////////////////////
-                            CIRCUIT BREAKER ADMIN
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Pauses or unpauses new increases across every market. Decreases and
-    ///         emergencyDecrease are unaffected either way.
-    function setBreakerPaused(bool paused_) external onlyOwner {
-        CIRCUIT_BREAKER.setPaused(paused_);
-    }
 }

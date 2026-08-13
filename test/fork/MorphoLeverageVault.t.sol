@@ -862,7 +862,8 @@ contract MorphoLeverageVaultForkTest is Test {
 
         CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
         vm.startPrank(owner);
-        vault.setBreakerPaused(true);
+        breaker.setPaused(true);
+        breaker.setRateLimitWindowSeconds(1 days);
         breaker.setMaxExposureChangePerWindow(wstEthMarketId, 1); // exhausted by anything real
         vm.stopPrank();
 
@@ -906,5 +907,74 @@ contract MorphoLeverageVaultForkTest is Test {
         assertEq(
             collateralAfter, collateralBefore - withdrawAmount, "emergency decrease succeeded despite pause + rate limit"
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        REALIZED SLIPPAGE CEILING
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Builds an increase swap that deliberately under-delivers by `shortfallBps`
+    ///      against the oracle rate, so the trade's realized slippage is a known quantity.
+    function _buildLossyIncreaseSwap(address collateralToken, address oracle, uint256 totalAmountUsdc, uint256 shortfallBps)
+        internal
+        returns (bytes memory data, uint256 delivered)
+    {
+        uint256 rate = ((1e54 / IOracle(oracle).price()) * (10_000 - shortfallBps)) / 10_000;
+        router.setRate(rate);
+        delivered = (totalAmountUsdc * rate) / 1e18;
+        deal(collateralToken, address(router), delivered);
+        data = abi.encodeCall(MockSwapRouter.swap, (IERC20(USDC), IERC20(collateralToken), totalAmountUsdc));
+    }
+
+    function _increaseWithSwap(uint256 ownAmount, bytes memory data, uint256 minOut) internal {
+        MarketAction[] memory actions = new MarketAction[](1);
+        actions[0] = MarketAction({
+            marketId: wstEthMarketId,
+            isIncrease: true,
+            amount: ownAmount,
+            leverage: LEVERAGE_2X,
+            minOut: minOut,
+            swapTarget: address(router),
+            swapCalldata: data
+        });
+        vm.prank(owner);
+        vault.executeActions(actions);
+    }
+
+    /// @dev The ceiling measures what a trade actually cost, not what the market's config
+    ///      would have permitted. A clean fill has to pass a ceiling tighter than the
+    ///      market's own maxSlippageBps, which is the whole distinction: previously the
+    ///      engine reported the static config value here, so any ceiling below
+    ///      SLIPPAGE_BPS rejected every trade including a perfect one.
+    function test_slippageCeiling_cleanFillPassesCeilingBelowMarketMax() public {
+        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        vm.prank(owner);
+        breaker.setMaxSlippageBpsCeiling(40); // below the market's SLIPPAGE_BPS of 50
+
+        uint256 ownAmount = 10_000e6;
+        (bytes memory data, uint256 expectedOut) =
+            _buildIncreaseSwap(WSTETH, WSTETH_ORACLE, (ownAmount * LEVERAGE_2X) / 1e18);
+
+        _increaseWithSwap(ownAmount, data, expectedOut);
+
+        (,, uint128 collateral) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertGt(collateral, 0, "a zero-slippage fill must clear a 40bps ceiling");
+    }
+
+    /// @dev And a fill that really does lose more than the ceiling is rejected, even though
+    ///      it clears the market's own oracle floor and would have executed fine before.
+    function test_slippageCeiling_lossyFillIsRejectedAfterTheFact() public {
+        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        vm.prank(owner);
+        breaker.setMaxSlippageBpsCeiling(20);
+
+        uint256 ownAmount = 10_000e6;
+        // 45bps of real loss: inside the market's 50bps oracle floor, so minOut passes and
+        // the swap executes, but past the 20bps ceiling once measured.
+        (bytes memory data,) = _buildLossyIncreaseSwap(WSTETH, WSTETH_ORACLE, (ownAmount * LEVERAGE_2X) / 1e18, 45);
+
+        // Asserts the measured figure, not just that it reverted: 45 in, 45 reported back.
+        vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.SlippageCeilingExceeded.selector, 45, 20));
+        _increaseWithSwap(ownAmount, data, 0); // minOut 0 -> defers to the oracle floor
     }
 }

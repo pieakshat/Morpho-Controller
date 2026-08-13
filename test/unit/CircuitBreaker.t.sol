@@ -54,8 +54,8 @@ contract MockVault is Ownable2Step {
         BREAKER.checkAfterIncrease(p);
     }
 
-    function callCheckAfterDecrease(Id id, uint256 unwoundValue) external {
-        BREAKER.checkAfterDecrease(id, unwoundValue);
+    function callCheckAfterDecrease(Id id, uint256 unwoundValue, uint256 price) external {
+        BREAKER.checkAfterDecrease(id, unwoundValue, price);
     }
 }
 
@@ -96,6 +96,7 @@ contract CircuitBreakerTest is Test {
             leverage: 2e18,
             totalAmount: 100e6,
             price: 1e36,
+            oracleExpectedOut: 100e6,
             slippageBpsUsed: 50
         });
     }
@@ -129,12 +130,13 @@ contract CircuitBreakerTest is Test {
         assertTrue(breaker.paused());
     }
 
-    function test_onlyOwner_acceptsVaultForwardedCall() public {
-        // Mirrors MorphoLeverageVault.setBreakerPaused: msg.sender at the breaker is the
-        // vault contract itself, not the EOA owner -- must be accepted too.
+    /// @dev The vault itself is NOT an admin. Accepting it would authorize every present and
+    ///      future vault code path to reach every setter here, and buys nothing -- the owner
+    ///      can call these directly, as the test above shows.
+    function test_onlyOwner_rejectsTheVaultItself() public {
         vm.prank(address(vault));
+        vm.expectRevert(CircuitBreaker.NotVaultOwner.selector);
         breaker.setPaused(true);
-        assertTrue(breaker.paused());
     }
 
     function test_ownershipTransfer_carriesBreakerAdminWithNoBreakerSideStep() public {
@@ -164,7 +166,7 @@ contract CircuitBreakerTest is Test {
         breaker.checkAfterIncrease(p);
 
         vm.expectRevert(CircuitBreaker.NotVault.selector);
-        breaker.checkAfterDecrease(marketId, 1);
+        breaker.checkAfterDecrease(marketId, 1, 1e36);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -192,7 +194,7 @@ contract CircuitBreakerTest is Test {
         breaker.setPaused(true);
 
         // Must not revert -- decreases are never blockable by the breaker.
-        vault.callCheckAfterDecrease(marketId, 1_000e6);
+        vault.callCheckAfterDecrease(marketId, 1_000e6, 1e36);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -247,6 +249,50 @@ contract CircuitBreakerTest is Test {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.InvalidPriceDeviationBps.selector, 10_001, 10_000));
         breaker.setMaxPriceDeviationBps(marketId, 10_001);
+    }
+
+    /// @dev A stale anchor measures cumulative drift, not a break. Comparing against a
+    ///      months-old price under a single bps threshold rejects any market that has simply
+    ///      been left alone, and the only fix available to an operator -- widening the
+    ///      threshold -- defeats the check. Past maxAge the anchor is ignored instead.
+    function test_priceDeviation_staleAnchorIsIgnored() public {
+        vm.startPrank(owner);
+        breaker.setMaxPriceDeviationBps(marketId, 100); // 1%
+        breaker.setPriceObservationMaxAge(1 days);
+        vm.stopPrank();
+
+        vault.callCheckBeforeIncrease(_params()); // anchor at 1e36, now
+
+        IncreaseCheckParams memory p = _params();
+        p.price = 1e36 * 2; // +100%, far beyond 1%
+
+        // Still fresh: correctly rejected.
+        vm.expectRevert(
+            abi.encodeWithSelector(CircuitBreaker.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
+        );
+        vault.callCheckBeforeIncrease(p);
+
+        // Same drift, but the anchor has aged out. Gradual drift is not a circuit-breaker
+        // event, so this must pass.
+        vm.warp(block.timestamp + 1 days + 1);
+        vault.callCheckBeforeIncrease(p);
+        assertEq(breaker.lastObservedPrice(marketId), p.price, "anchor re-seeded at the new price");
+    }
+
+    /// @dev maxAge of 0 keeps the old always-compare behavior.
+    function test_priceDeviation_maxAgeZeroNeverExpires() public {
+        vm.prank(owner);
+        breaker.setMaxPriceDeviationBps(marketId, 100);
+
+        vault.callCheckBeforeIncrease(_params());
+
+        vm.warp(block.timestamp + 3650 days);
+        IncreaseCheckParams memory p = _params();
+        p.price = 1e36 * 2;
+        vm.expectRevert(
+            abi.encodeWithSelector(CircuitBreaker.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
+        );
+        vault.callCheckBeforeIncrease(p);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -308,12 +354,84 @@ contract CircuitBreakerTest is Test {
         vault.callCheckBeforeIncrease(p); // maxExposureChangePerWindow defaults to 0 = off
     }
 
+    /// @dev With a zero window every call looks like a fresh period, which would silently
+    ///      turn a per-window budget into a per-action one. Rejected at the setter instead.
+    function test_setMaxExposureChangePerWindow_revertsWhenWindowUnset() public {
+        vm.prank(owner);
+        vm.expectRevert(CircuitBreaker.RateLimitWindowNotSet.selector);
+        breaker.setMaxExposureChangePerWindow(marketId, 100e6);
+    }
+
+    function test_setMaxExposureChangePerWindow_zeroCapAllowedWithoutWindow() public {
+        vm.prank(owner);
+        breaker.setMaxExposureChangePerWindow(marketId, 0); // clearing is always fine
+    }
+
+    /// @dev Clearing the window afterwards disables rate limiting rather than reverting to
+    ///      per-action semantics.
+    function test_rateLimit_disabledWhenWindowClearedAfterCapSet() public {
+        vm.startPrank(owner);
+        breaker.setRateLimitWindowSeconds(1 hours);
+        breaker.setMaxExposureChangePerWindow(marketId, 100e6);
+        breaker.setRateLimitWindowSeconds(0);
+        vm.stopPrank();
+
+        IncreaseCheckParams memory p = _params();
+        p.totalAmount = 10_000_000e6;
+        vault.callCheckBeforeIncrease(p);
+    }
+
     /*//////////////////////////////////////////////////////////////
                               AFTER DECREASE
     //////////////////////////////////////////////////////////////*/
 
     function test_checkAfterDecrease_neverRevertsEvenForHugeValue() public {
-        vault.callCheckAfterDecrease(marketId, type(uint256).max);
+        vault.callCheckAfterDecrease(marketId, type(uint256).max, 1e36);
+    }
+
+    /// @dev An unwind must hand budget back, not spend it. Charging a decrease against the
+    ///      same counter that gates increases meant de-risking locked the allocator out of
+    ///      re-entering the market it had just made safer.
+    function test_decreaseReleasesBudgetInsteadOfConsumingIt() public {
+        vm.startPrank(owner);
+        breaker.setRateLimitWindowSeconds(1 days);
+        breaker.setMaxExposureChangePerWindow(marketId, 1_000_000e6);
+        vm.stopPrank();
+
+        IncreaseCheckParams memory p = _params();
+        p.totalAmount = 900_000e6;
+        vault.callCheckBeforeIncrease(p);
+        assertEq(breaker.windowExposureChange(marketId), 900_000e6, "increase consumes budget");
+
+        // Unwind most of it back out.
+        vault.callCheckAfterDecrease(marketId, 800_000e6, 1e36);
+        assertEq(breaker.windowExposureChange(marketId), 100_000e6, "unwind returns budget");
+
+        // Re-entry that would have been blocked before now fits.
+        p.totalAmount = 200_000e6;
+        (bool ok,) = breaker.previewBeforeIncrease(p);
+        assertTrue(ok, "de-risking must not lock out re-entry");
+    }
+
+    /// @dev Saturates at zero rather than wrapping, since this path must never revert.
+    function test_decreaseLargerThanWindowSaturatesAtZero() public {
+        vm.startPrank(owner);
+        breaker.setRateLimitWindowSeconds(1 days);
+        breaker.setMaxExposureChangePerWindow(marketId, 1_000_000e6);
+        vm.stopPrank();
+
+        IncreaseCheckParams memory p = _params();
+        p.totalAmount = 100e6;
+        vault.callCheckBeforeIncrease(p);
+
+        vault.callCheckAfterDecrease(marketId, type(uint256).max, 1e36);
+        assertEq(breaker.windowExposureChange(marketId), 0);
+    }
+
+    function test_decreaseRefreshesThePriceAnchor() public {
+        vault.callCheckAfterDecrease(marketId, 1e6, 2e36);
+        assertEq(breaker.lastObservedPrice(marketId), 2e36);
+        assertEq(breaker.lastObservedAt(marketId), block.timestamp);
     }
 
     /*//////////////////////////////////////////////////////////////

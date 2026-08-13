@@ -72,29 +72,16 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         require(action.leverage >= 1e18, LeverageBelowOneX(action.leverage));
         require(action.leverage <= config.maxLeverage, LeverageExceedsMax(action.leverage, config.maxLeverage));
 
-        uint256 totalAmount = (action.amount * action.leverage) / 1e18;
-        uint256 price = IOracle(config.params.oracle).price();
-
-        // loanToken -> collateralToken, so the oracle's collateral-per-loan-token rate is
-        // the inverse of the price it quotes.
-        uint256 minSwapOut = _effectiveMinOut(
-            MorphoSharesMath.mulDivDown(totalAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price),
-            config.maxSlippageBps,
-            action.minOut
-        );
-
         // Built once and reused for both hook calls below: same memory pointer either way,
         // so passing it twice costs nothing extra and can't let the two checks disagree on
-        // what this action actually was.
-        IncreaseCheckParams memory checkParams = IncreaseCheckParams({
-            marketId: id,
-            params: config.params,
-            leverage: action.leverage,
-            totalAmount: totalAmount,
-            price: price,
-            slippageBpsUsed: config.maxSlippageBps
-        });
+        // what this action actually was. Every derived number lives on the struct rather
+        // than in locals here, which is what keeps this function's stack shallow enough to
+        // compile. slippageBpsUsed is filled in after the bundle runs, since before it there
+        // is no realized slippage to report.
+        IncreaseCheckParams memory checkParams = _buildIncreaseCheckParams(id, config, action);
         CIRCUIT_BREAKER.checkBeforeIncrease(checkParams);
+
+        (,, uint128 collateralBefore) = MORPHO.position(id, address(this));
 
         // Plain transfer rather than a bundled Call: inside a bundle a Call here would
         // execute as Bundler3, which holds nothing, instead of this adapter.
@@ -102,12 +89,59 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
 
         _flashloanAndExecute(
             config.params.loanToken,
-            totalAmount,
-            _buildIncreaseBundle(config.params, totalAmount, totalAmount - action.amount, minSwapOut, action)
+            checkParams.totalAmount,
+            _buildIncreaseBundle(
+                config.params,
+                checkParams.totalAmount,
+                checkParams.totalAmount - action.amount,
+                _effectiveMinOut(checkParams.oracleExpectedOut, config.maxSlippageBps, action.minOut),
+                action
+            )
         );
         _markActive(id);
 
+        // Measured, not assumed: the collateral this position actually gained against what
+        // the oracle said the same loan tokens were worth. The registry's maxSlippageBps
+        // bounds what a trade is allowed to lose beforehand; this is what it did lose.
+        checkParams.slippageBpsUsed =
+            _realizedSlippageBps(checkParams.oracleExpectedOut, _collateralGained(id, collateralBefore));
         CIRCUIT_BREAKER.checkAfterIncrease(checkParams);
+    }
+
+    /// @dev Split out of _increasePosition purely to keep its stack shallow — that function
+    ///      has hit stack-too-deep three times now, and the fix each time was extraction
+    ///      rather than --via-ir.
+    function _buildIncreaseCheckParams(Id id, MorphoMarketConfig memory config, MarketAction memory action)
+        private
+        view
+        returns (IncreaseCheckParams memory)
+    {
+        uint256 totalAmount = (action.amount * action.leverage) / 1e18;
+        uint256 price = IOracle(config.params.oracle).price();
+
+        return IncreaseCheckParams({
+            marketId: id,
+            params: config.params,
+            leverage: action.leverage,
+            totalAmount: totalAmount,
+            price: price,
+            // loanToken -> collateralToken, so the oracle's collateral-per-loan-token rate
+            // is the inverse of the price it quotes.
+            oracleExpectedOut: MorphoSharesMath.mulDivDown(totalAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price),
+            slippageBpsUsed: 0
+        });
+    }
+
+    function _collateralGained(Id id, uint128 collateralBefore) private view returns (uint256) {
+        (,, uint128 collateralAfter) = MORPHO.position(id, address(this));
+        return collateralAfter > collateralBefore ? collateralAfter - collateralBefore : 0;
+    }
+
+    /// @dev Shortfall of `actualOut` against `expectedOut`, in bps. Zero when the swap met
+    ///      or beat the oracle, and zero when there is no expectation to measure against.
+    function _realizedSlippageBps(uint256 expectedOut, uint256 actualOut) private pure returns (uint256) {
+        if (expectedOut == 0 || actualOut >= expectedOut) return 0;
+        return ((expectedOut - actualOut) * 10_000) / expectedOut;
     }
 
     /// @dev Builds the nested Call[] for an increase: move the borrowed loanToken to the
@@ -194,8 +228,8 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     ///      bad fill reverts cleanly in the swap executor instead of failing later when
     ///      the flashloan can't be covered.
     function _decreasePosition(MarketAction memory action) internal {
-        uint256 unwoundValue = _decreasePositionCore(action);
-        CIRCUIT_BREAKER.checkAfterDecrease(action.marketId, unwoundValue);
+        (uint256 unwoundValue, uint256 price) = _decreasePositionCore(action);
+        CIRCUIT_BREAKER.checkAfterDecrease(action.marketId, unwoundValue, price);
     }
 
     /// @dev Same as _decreasePosition but skips CIRCUIT_BREAKER entirely — used only by
@@ -207,7 +241,7 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         _decreasePositionCore(action);
     }
 
-    function _decreasePositionCore(MarketAction memory action) private returns (uint256 unwoundValue) {
+    function _decreasePositionCore(MarketAction memory action) private returns (uint256 unwoundValue, uint256 price) {
         Id id = action.marketId;
         require(_isRegistered[id], MarketNotRegistered(id));
         MarketParams memory params = _marketConfigs[id].params;
@@ -218,9 +252,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         // collateralToken -> loanToken, the opposite direction from an increase, so here
         // the oracle price applies directly rather than inverted. Also what CircuitBreaker
         // sees as this action's exposure change, via checkAfterDecrease above.
-        unwoundValue = MorphoSharesMath.mulDivDown(
-            plan.collateralToWithdraw, IOracle(params.oracle).price(), MorphoSharesMath.ORACLE_PRICE_SCALE
-        );
+        price = IOracle(params.oracle).price();
+        unwoundValue =
+            MorphoSharesMath.mulDivDown(plan.collateralToWithdraw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
         plan.minSwapOut = _effectiveMinOut(unwoundValue, _marketConfigs[id].maxSlippageBps, action.minOut);
 
         Call[] memory nested = _buildDecreaseBundle(params, plan, action);

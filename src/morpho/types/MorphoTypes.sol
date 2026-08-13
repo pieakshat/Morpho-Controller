@@ -36,6 +36,14 @@ struct IncreaseCheckParams {
     uint256 leverage;
     uint256 totalAmount;
     uint256 price;
+    /// @dev The collateral the oracle says `totalAmount` of loan token is worth, before any
+    ///      swap happens. The after-hook compares the collateral actually gained against
+    ///      this to derive what the trade really cost.
+    uint256 oracleExpectedOut;
+    /// @dev Realized slippage in bps, only meaningful in checkAfterIncrease — the shortfall
+    ///      between oracleExpectedOut and the collateral the position actually gained. Left
+    ///      zero on the before-hook, where the trade has not happened yet and no honest
+    ///      value exists.
     uint256 slippageBpsUsed;
 }
 

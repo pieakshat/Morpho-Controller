@@ -39,11 +39,19 @@ contract CircuitBreaker {
     ///      nothing here needs separate setup before that's true.
     mapping(Id => uint256) public minHealthFactor;
     mapping(Id => uint256) public maxPriceDeviationBps;
-    /// @dev 1e36-scaled, IOracle's own convention. Always updated on every checkBeforeIncrease
+    /// @dev 1e36-scaled, IOracle's own convention. Refreshed by both increases and decreases,
     ///      regardless of whether maxPriceDeviationBps is set, so the baseline is never stale
     ///      by the time the check does get turned on.
     mapping(Id => uint256) public lastObservedPrice;
+    /// @dev When lastObservedPrice was written. A deviation check against an anchor from
+    ///      months ago measures drift, not a break, so an observation older than
+    ///      priceObservationMaxAge is treated as no anchor at all rather than as a breach.
+    mapping(Id => uint256) public lastObservedAt;
 
+    /// @dev Net exposure growth for the market inside the current window, not gross churn:
+    ///      increases add, decreases subtract, floored at zero. Gating increases on gross
+    ///      churn would let a de-risking unwind consume the very budget needed to re-enter
+    ///      afterwards, which punishes exactly the behavior this contract wants.
     mapping(Id => uint256) public maxExposureChangePerWindow;
     mapping(Id => uint256) public windowStart;
     mapping(Id => uint256) public windowExposureChange;
@@ -56,10 +64,17 @@ contract CircuitBreaker {
     mapping(address => uint256) public maxAssetExposure;
 
     uint256 public maxAggregateDebt;
-    /// @dev A global re-check on top of MorphoMarketRegistry's own per-market slippage
-    ///      floor — the engine passes the effective bps it actually used for this trade.
+    /// @dev Ceiling on the slippage a single increase actually realized, measured after the
+    ///      fact by the engine as the shortfall between the collateral the oracle implied
+    ///      and the collateral the position really gained. Distinct from
+    ///      MorphoMarketRegistry's maxSlippageBps, which bounds what a trade is *allowed* to
+    ///      lose before it executes; this bounds what it *did* lose.
     uint256 public maxSlippageBpsCeiling;
     uint256 public rateLimitWindowSeconds;
+    /// @dev Age beyond which lastObservedPrice stops being treated as a deviation anchor.
+    ///      Zero means never expire, preserving the old always-compare behavior for anyone
+    ///      who wants it.
+    uint256 public priceObservationMaxAge;
 
     uint256 internal constant MAX_PRICE_DEVIATION_BPS_LIMIT = 10_000;
     /// @dev Mirrors MorphoMarketRegistry.MAX_SLIPPAGE_BPS_LIMIT.
@@ -69,6 +84,7 @@ contract CircuitBreaker {
     error NotVault();
     error InvalidPriceDeviationBps(uint256 requested, uint256 limit);
     error InvalidSlippageBpsCeiling(uint256 requested, uint256 limit);
+    error RateLimitWindowNotSet();
     error Paused();
     error PriceDeviationExceeded(Id id, uint256 newPrice, uint256 lastPrice, uint256 maxBps);
     error RateLimitExceeded(Id id, uint256 attempted, uint256 cap);
@@ -85,19 +101,19 @@ contract CircuitBreaker {
     event MaxAggregateDebtUpdated(uint256 cap);
     event MaxSlippageBpsCeilingUpdated(uint256 ceiling);
     event RateLimitWindowSecondsUpdated(uint256 windowSeconds);
+    event PriceObservationMaxAgeUpdated(uint256 maxAge);
     event PriceObserved(Id indexed id, uint256 price);
 
     /// @dev Single-sources admin rights from the vault's own owner rather than running a
     ///      second, separate Ownable2Step flow that could desync from it — an ownership
-    ///      transfer on the vault carries over here with no extra step. Also accepts
-    ///      msg.sender == VAULT: MorphoLeverageVault exposes setBreakerPaused as an
-    ///      owner-gated passthrough, and a call arriving that way has msg.sender == the
-    ///      vault contract, not the EOA/multisig that is IOwnableView(VAULT).owner() — the
-    ///      vault's own onlyOwner already ran before it forwarded the call, so trusting
-    ///      VAULT itself here adds no new path to these setters, just a second valid caller
-    ///      for the one that already exists.
+    ///      transfer on the vault carries over here with no extra step.
+    ///
+    ///      Deliberately does NOT accept msg.sender == VAULT. Doing so would authorize every
+    ///      present and future vault code path to reach every setter here, and it buys
+    ///      nothing: the owner resolved below can call these setters directly, so a
+    ///      forwarding helper on the vault would only be a second route to the same place.
     modifier onlyOwner() {
-        require(msg.sender == VAULT || msg.sender == IOwnableView(VAULT).owner(), NotVaultOwner());
+        require(msg.sender == IOwnableView(VAULT).owner(), NotVaultOwner());
         _;
     }
 
@@ -135,7 +151,11 @@ contract CircuitBreaker {
         emit MaxPriceDeviationBpsUpdated(id, bps);
     }
 
+    /// @dev Rejects a live cap while rateLimitWindowSeconds is still 0. Without that guard
+    ///      the zero window makes every call look like a fresh period, silently turning what
+    ///      reads as a per-window budget into a per-action one. Set the window first.
     function setMaxExposureChangePerWindow(Id id, uint256 cap) external onlyOwner {
+        require(cap == 0 || rateLimitWindowSeconds != 0, RateLimitWindowNotSet());
         maxExposureChangePerWindow[id] = cap;
         emit MaxExposureChangePerWindowUpdated(id, cap);
     }
@@ -163,6 +183,11 @@ contract CircuitBreaker {
         emit RateLimitWindowSecondsUpdated(windowSeconds);
     }
 
+    function setPriceObservationMaxAge(uint256 maxAge) external onlyOwner {
+        priceObservationMaxAge = maxAge;
+        emit PriceObservationMaxAgeUpdated(maxAge);
+    }
+
     /*//////////////////////////////////////////////////////////////
                               ENGINE HOOKS
     //////////////////////////////////////////////////////////////*/
@@ -173,10 +198,8 @@ contract CircuitBreaker {
     function checkBeforeIncrease(IncreaseCheckParams calldata p) external onlyVault {
         evaluateBeforeIncrease(p);
 
-        lastObservedPrice[p.marketId] = p.price;
-        emit PriceObserved(p.marketId, p.price);
-
-        _accumulateWindow(p.marketId, p.totalAmount);
+        _recordPrice(p.marketId, p.price);
+        _addWindowExposure(p.marketId, p.totalAmount);
     }
 
     /// @notice The read-only half of checkBeforeIncrease's logic, with no side effects.
@@ -189,16 +212,17 @@ contract CircuitBreaker {
     function evaluateBeforeIncrease(IncreaseCheckParams calldata p) public view {
         require(!paused, Paused());
 
-        uint256 last = lastObservedPrice[p.marketId];
         uint256 devBps = maxPriceDeviationBps[p.marketId];
-        if (last != 0 && devBps != 0) {
+        if (devBps != 0 && _anchorIsUsable(p.marketId)) {
+            uint256 last = lastObservedPrice[p.marketId];
             uint256 diff = p.price > last ? p.price - last : last - p.price;
             require(diff <= (last * devBps) / 10_000, PriceDeviationExceeded(p.marketId, p.price, last, devBps));
         }
 
         uint256 cap = maxExposureChangePerWindow[p.marketId];
+        if (cap == 0 || rateLimitWindowSeconds == 0) return;
         uint256 attempted = _previewWindowTotal(p.marketId, p.totalAmount);
-        require(cap == 0 || attempted <= cap, RateLimitExceeded(p.marketId, attempted, cap));
+        require(attempted <= cap, RateLimitExceeded(p.marketId, attempted, cap));
     }
 
     /// @notice A pure preview of checkBeforeIncrease: same code path via evaluateBeforeIncrease,
@@ -225,12 +249,20 @@ contract CircuitBreaker {
         require(ceiling == 0 || p.slippageBpsUsed <= ceiling, SlippageCeilingExceeded(p.slippageBpsUsed, ceiling));
     }
 
-    /// @notice Bookkeeping only for a decrease: folds the unwound value into the market's
-    ///         rate-limit window. Never reverts — decreases reduce risk, so nothing about a
-    ///         decrease should be blockable by this contract, including this call itself
-    ///         being asked to account for an unusually large one.
-    function checkAfterDecrease(Id id, uint256 unwoundValue) external onlyVault {
-        _accumulateWindow(id, unwoundValue);
+    /// @notice Bookkeeping only for a decrease: releases the unwound value back into the
+    ///         market's rate-limit budget and refreshes the price anchor. Never reverts —
+    ///         decreases reduce risk, so nothing about a decrease should be blockable by
+    ///         this contract, including this call itself being asked to account for an
+    ///         unusually large one.
+    /// @dev Releasing rather than consuming is the whole point. The budget bounds how fast
+    ///      exposure can grow; an unwind shrinks exposure, so charging it would mean a
+    ///      de-risking allocator locks itself out of re-entering the market it just made
+    ///      safer — worst precisely during the volatility that prompted the unwind.
+    ///      Refreshing the anchor here keeps a long decrease-only stretch from leaving a
+    ///      stale price behind for the next increase to be judged against.
+    function checkAfterDecrease(Id id, uint256 unwoundValue, uint256 price) external onlyVault {
+        _releaseWindowExposure(id, unwoundValue);
+        _recordPrice(id, price);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -317,13 +349,31 @@ contract CircuitBreaker {
         );
     }
 
+    function _recordPrice(Id id, uint256 price) private {
+        lastObservedPrice[id] = price;
+        lastObservedAt[id] = block.timestamp;
+        emit PriceObserved(id, price);
+    }
+
+    /// @dev An anchor is only worth comparing against if one exists and is recent enough.
+    ///      A months-old anchor measures cumulative drift, which is indistinguishable from
+    ///      a break under a single bps threshold, so it would reject legitimate increases
+    ///      into any market that has simply been left alone for a while.
+    function _anchorIsUsable(Id id) private view returns (bool) {
+        if (lastObservedPrice[id] == 0) return false;
+        uint256 maxAge = priceObservationMaxAge;
+        return maxAge == 0 || block.timestamp - lastObservedAt[id] <= maxAge;
+    }
+
+    function _windowExpired(Id id) private view returns (bool) {
+        return block.timestamp - windowStart[id] >= rateLimitWindowSeconds;
+    }
+
     /// @dev What windowExposureChange[id] would become after adding `delta`, without
-    ///      writing anything — the read-only twin of _accumulateWindow, used by
+    ///      writing anything — the read-only twin of _addWindowExposure, used by
     ///      evaluateBeforeIncrease so a preview and the real check can't disagree.
     function _previewWindowTotal(Id id, uint256 delta) private view returns (uint256) {
-        if (block.timestamp - windowStart[id] >= rateLimitWindowSeconds) {
-            return delta;
-        }
+        if (_windowExpired(id)) return delta;
         return windowExposureChange[id] + delta;
     }
 
@@ -331,13 +381,26 @@ contract CircuitBreaker {
     ///      cap if a caller acts right at a window's end and again right after the next one
     ///      starts. That boundary-burst behavior is a known, accepted tradeoff, not a bug —
     ///      a sliding log would close it at the cost of unbounded per-market storage growth.
-    function _accumulateWindow(Id id, uint256 delta) private {
-        if (block.timestamp - windowStart[id] >= rateLimitWindowSeconds) {
+    function _addWindowExposure(Id id, uint256 delta) private {
+        if (_windowExpired(id)) {
             windowStart[id] = block.timestamp;
             windowExposureChange[id] = delta;
         } else {
             windowExposureChange[id] += delta;
         }
+    }
+
+    /// @dev Saturating subtraction, never a revert: this runs on the decrease path, which
+    ///      must stay unblockable. An unwind larger than the window's recorded growth just
+    ///      empties the budget rather than wrapping.
+    function _releaseWindowExposure(Id id, uint256 delta) private {
+        if (_windowExpired(id)) {
+            windowStart[id] = block.timestamp;
+            windowExposureChange[id] = 0;
+            return;
+        }
+        uint256 current = windowExposureChange[id];
+        windowExposureChange[id] = current > delta ? current - delta : 0;
     }
 
     function _selectorFromRevertReason(bytes memory reason) private pure returns (bytes4 selector) {
