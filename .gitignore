@@ -18,3 +18,7 @@ docs/
 .env
 .env.*
 !.env.example
+
+# Local fork deployment artifacts (see DEPLOYMENT_LABEL in script/Config.sol)
+deployments/*.local.json
+broadcast/

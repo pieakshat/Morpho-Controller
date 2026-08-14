@@ -11,4 +11,11 @@ remappings = [
     "forge-std/=lib/forge-std/src/",
 ]
 
+# Scoped to exactly what the deploy scripts touch: chain config is read-only input, the
+# deployment artifact is the only thing they are allowed to write.
+fs_permissions = [
+    { access = "read", path = "./script/config" },
+    { access = "read-write", path = "./deployments" },
+]
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

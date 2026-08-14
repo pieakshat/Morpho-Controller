@@ -1,0 +1,53 @@
+{
+  "_comment": "Arbitrum One. Core addresses were read from the deployed contracts, not from docs; see README. Market params must match Morpho Blue exactly, since the market Id is keccak256(abi.encode(params)) and a typo silently produces a valid-looking Id for a market that does not exist. Deploy.s.sol checks each one against Morpho before registering.",
+
+  "chainName": "arbitrum",
+
+  "core": {
+    "morpho": "0x6c247b1F6182318877311737BaC0844bAa518F5e",
+    "bundler3": "0x1FA4431bC113D308beE1d46B0e98Cb805FB48C13",
+    "generalAdapter1": "0x9954aFB60BB5A222714c478ac86990F221788B88"
+  },
+
+  "asset": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+  "assetDecimals": 6,
+
+  "_marketsComment": "marketCount must match the array length: Foundry has no way to read an array's length from JSON, and struct-decoding an array depends on alphabetical field ordering, which is far more fragile than one explicit number. loanToken must equal asset above or registerMarket reverts LoanTokenMismatch. maxLeverage is a ceiling on what an action may request, not a target. The three breaker fields here are per-market; global ones live under .breaker.",
+  "marketCount": 1,
+  "markets": [
+    {
+      "name": "wstETH/USDC 86%",
+      "loanToken": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      "collateralToken": "0x5979D7b546E38E414F7E9822514be443A4800529",
+      "oracle": "0x8e02a9b9Cc29d783b2fCB71C3a72651B591cae31",
+      "irm": "0x66F30587FB8D4206918deb78ecA7d5eBbafD06DA",
+      "lltv": "860000000000000000",
+      "maxLeverage": "5000000000000000000",
+      "maxSlippageBps": 50,
+      "minHealthFactor": "1150000000000000000",
+      "maxPriceDeviationBps": 500,
+      "maxExposureChangePerWindow": "2000000000000",
+      "assetExposureCap": "8000000000000"
+    }
+  ],
+
+  "_seedComment": "Minted to the burn address, never to the deployer. Seeding closes the first-depositor inflation window because the donation needed to floor a victim scales with 1000 * victimDeposit * (seed + 1); shares that could be redeemed later would reopen it. See test/unit/InflationAttack.t.sol.",
+  "seed": {
+    "amount": "1000000000",
+    "burnAddress": "0x000000000000000000000000000000000000dEaD"
+  },
+
+  "_vaultComment": "actionDropToleranceBps caps how much value one executeActions batch may destroy. Contract default is 100 (1%); the vault hard-caps it at 1000.",
+  "vault": {
+    "actionDropToleranceBps": 100
+  },
+
+  "_breakerComment": "Global thresholds only; per-market ones live on each market entry. Every threshold is fail-open: 0 means unenforced. rateLimitWindowSeconds MUST be set before any maxExposureChangePerWindow or the setter reverts RateLimitWindowNotSet, since a zero window silently turns a per-window budget into a per-action one. maxSlippageBpsCeiling bounds slippage a trade actually realized, measured after the fact, so it can sit below a market's own maxSlippageBps.",
+  "breaker": {
+    "paused": false,
+    "priceObservationMaxAge": 86400,
+    "rateLimitWindowSeconds": 86400,
+    "maxAggregateDebt": "5000000000000",
+    "maxSlippageBpsCeiling": 100
+  }
+}

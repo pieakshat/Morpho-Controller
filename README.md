@@ -232,6 +232,16 @@ test/
                                   Bundler3, and GeneralAdapter1
   audit/                         adversarial tests, one per attack hypothesis, each
                                   either demonstrating a flaw or proving it is blocked
+
+script/
+  Config.sol                     shared loader for the chain config JSON
+  Deploy.s.sol                   deploy, register markets, set limits, seed
+  RegisterMarket.s.sol           add a market to a live vault
+  ConfigureBreaker.s.sol         reapply breaker thresholds, or emit multisig calldata
+  LocalLoop.s.sol                fork-only increase/close cycle against a mock venue
+  config/<chainid>.json          addresses, market params, and risk policy
+
+deployments/<chainid>.json       written by Deploy, read by the allocator service
 ```
 
 ## Testing
@@ -265,6 +275,55 @@ forge build
 ```
 
 Copy `.env.example` to `.env` and fill in `ARBITRUM_RPC_URL` before running fork tests.
+
+## Deployment
+
+Addresses and risk policy live in `script/config/<chainid>.json`, not in Solidity, so adding a chain is a new file rather than a new branch and changing a threshold is not a code change. `script/Deploy.s.sol` reads it, deploys the vault, registers every market, applies the breaker thresholds, seeds the vault, and writes `deployments/<chainid>.json`. That artifact is the handoff to the off-chain allocator, which reads its addresses from there rather than carrying a copy.
+
+```shell
+forge script script/Deploy.s.sol --rpc-url $ARBITRUM_RPC_URL --broadcast --verify
+```
+
+Three ordering constraints are baked into the script, all of them things that fail confusingly if done in the wrong order:
+
+**Ownership is configured before it is handed over.** `CircuitBreaker` resolves its admin as the vault's current `owner()`, and `Ownable` sets that in the constructor, so deploying straight to a multisig would lock the script out of `registerMarket`, `setAllocator`, and every breaker setter. The vault is always deployed owned by the deployer, configured, and only then transferred. The transfer cannot complete from a script either: `Ownable2Step` needs the incoming owner to call `acceptOwnership()`. Set `VAULT_OWNER` to initiate it, and the script says loudly that it is pending.
+
+**The rate-limit window precedes every per-market cap.** `setMaxExposureChangePerWindow` reverts `RateLimitWindowNotSet` while the window is zero.
+
+**Markets are checked against Morpho before registration.** `registerMarket` computes `Id = keccak256(abi.encode(params))` and stores it without asking whether the market exists, so one wrong byte in `oracle`, `irm`, or `lltv` registers a valid-looking Id for a market that was never created and fails much later inside Morpho. The script asserts `lastUpdate != 0` first.
+
+Post-deploy admin lives in two scripts, kept separate from `Deploy` because once ownership is a multisig nobody can run them as transactions:
+
+```shell
+MARKET_INDEX=1 forge script script/RegisterMarket.s.sol --rpc-url $RPC --broadcast
+forge script script/ConfigureBreaker.s.sol --sig "printCalldata()" --rpc-url $RPC
+```
+
+`printCalldata` emits the encoded breaker calls in dependency order for a multisig to execute.
+
+### Local fork runbook
+
+`script/LocalLoop.s.sol` drives a full increase and full close against a deployed vault using `MockSwapRouter`, which proves the deployment is operable rather than merely configured. Local development only: that router fills at whatever rate it is told and holds no real liquidity.
+
+Note `DEPLOYMENT_LABEL=local`. A fork reports the forked chain's id, so an anvil fork of Arbitrum is chain 42161 and an unlabelled local run would overwrite the real deployment record with a throwaway address, with nothing in the file to show it.
+
+```shell
+anvil --fork-url $ARBITRUM_RPC_URL --fork-block-number 491260000
+```
+
+Fund the deployer by writing the token's balance slot directly (`cast index address <addr> 9` for USDC, slot `1` for wstETH on Arbitrum) rather than draining a real holder, which would disturb protocol state on the fork. Then, with `DEPLOYMENT_LABEL=local` set throughout:
+
+```shell
+forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
+```
+
+```shell
+forge script script/LocalLoop.s.sol --sig "setup()" --rpc-url http://127.0.0.1:8545 --broadcast
+```
+
+`setup` logs the router address. Fund it with collateral token, then use `--sig "quote()"` to print exactly how much each leg needs before running `openPosition()` and `closePosition()`.
+
+A clean round trip at 2x on 100,000 USDC of own capital returns the vault to zero collateral, zero borrow shares, an empty active set, and `totalAssets` within single-digit wei of where it started.
 
 ## Status and roadmap
 
