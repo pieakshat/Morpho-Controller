@@ -1,0 +1,9 @@
+{
+  "//": "Slither is scoped to src/ only. lib/ is audited third-party code (OpenZeppelin, forge-std), test/ and script/ are not deployed, and including them buries real findings under noise from mocks and cheatcode plumbing.",
+  "filter_paths": "lib/|test/|script/",
+  "//detectors": "solc-version and naming-convention are the two that fire constantly on a pinned-solc project with Morpho's own naming carried over. assembly fires on the one selector-extraction block in RiskLimits, which is deliberate and commented.",
+  "exclude_informational": true,
+  "exclude_low": false,
+  "exclude_dependencies": true,
+  "solc_remaps": ["@openzeppelin/=lib/openzeppelin-contracts/", "forge-std/=lib/forge-std/src/"]
+}

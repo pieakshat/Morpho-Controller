@@ -1,0 +1,50 @@
+name: Slither
+
+permissions: {}
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  slither:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Findings are uploaded as SARIF so they appear inline on the PR diff rather than only
+      # in the job log.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: crytic/slither-action@v0
+        id: slither
+        continue-on-error: true
+        with:
+          target: "."
+          slither-config: slither.config.json
+          sarif: results.sarif
+          # High and above only, to start. Slither has never run against this codebase, so
+          # anything stricter would likely block the first PR on findings nobody has triaged.
+          # Tighten to medium once the initial output has been read and either fixed or
+          # explicitly dismissed in the Security tab.
+          fail-on: high
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.slither.outputs.sarif }}
+
+      # continue-on-error above lets the SARIF upload happen even when Slither fails, so the
+      # findings are still visible. This step is what actually reddens the job.
+      - name: Fail if Slither found something at or above the threshold
+        if: steps.slither.outcome == 'failure'
+        run: |
+          echo "::error title=Slither findings::Slither reported findings at or above the configured threshold. See the Security tab or the step log above."
+          exit 1

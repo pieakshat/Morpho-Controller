@@ -1,0 +1,164 @@
+name: CI
+
+permissions: {}
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every fork test pins this block, so the RPC cache below is deterministic. Bump it here
+  # and in the test files together, which also invalidates the cache key.
+  FORK_BLOCK: "491260000"
+
+jobs:
+  # Everything that needs no network. Gates every PR, including ones from forks, which never
+  # receive secrets.
+  contracts:
+    name: Contracts (offline)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - run: forge --version
+
+      - name: Format
+        run: forge fmt --check
+
+      # Fails the build if any contract exceeds EIP-170. MorphoLeverageVault runs close to
+      # it: ~21.1 KB of the 24,576 limit, leaving under 3.5 KB of margin.
+      - name: Build and check contract sizes
+        run: forge build --sizes
+
+      - name: Test (offline tiers)
+        run: forge test --match-path 'test/{unit,vectors}/*' --no-match-contract ValuationVectors
+
+      # Fuzz tests are excluded: their gas varies with the seed, which would make this flap.
+      - name: Gas snapshot
+        run: forge snapshot --check --match-path 'test/unit/*' --no-match-test 'testFuzz'
+
+      # The math and revert vectors need no RPC, so their drift check runs here too. That
+      # keeps the most common kind of drift caught even on PRs from forks, which get no
+      # secrets and therefore never reach the fork job below.
+      - name: Offline golden vectors are up to date
+        run: |
+          forge test --match-path 'test/vectors/*' --no-match-contract ValuationVectors
+          if ! git diff --exit-code -- allocator/packages/core/test/vectors/shares-math.json allocator/packages/planner/test/vectors; then
+            echo "::error title=Stale golden vectors::Regenerate with: forge test --match-path 'test/vectors/*'"
+            exit 1
+          fi
+
+  # Fork and adversarial tiers, plus the vector-drift check. Needs an archive RPC.
+  contracts-fork:
+    name: Contracts (fork)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      # The secrets context is not available in a job-level `if`, so the guard has to be a
+      # step. PRs opened from forks get no secrets; those runs skip rather than fail, and say
+      # so loudly instead of reporting a silent green.
+      - name: Check for RPC secret
+        id: rpc
+        env:
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+        run: |
+          if [ -n "$ARBITRUM_RPC_URL" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Fork tests skipped::ARBITRUM_RPC_URL is not available (expected for PRs from forks). The fork, audit, and vector-drift checks did not run."
+          fi
+
+      # The pinned block makes this cache exact: after the first run the fork tests are
+      # served almost entirely from disk, which keeps RPC usage near zero and the job fast.
+      - name: Cache Foundry RPC responses
+        if: steps.rpc.outputs.available == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.foundry/cache/rpc
+          key: foundry-rpc-arbitrum-${{ env.FORK_BLOCK }}-${{ hashFiles('test/fork/**', 'test/audit/**', 'test/vectors/ValuationVectors.t.sol') }}
+          restore-keys: |
+            foundry-rpc-arbitrum-${{ env.FORK_BLOCK }}-
+
+      - name: Test (fork and audit tiers)
+        if: steps.rpc.outputs.available == 'true'
+        env:
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+        run: forge test --match-path 'test/{fork,audit}/*'
+
+      # The golden vectors are committed, so a change to MorphoSharesMath or
+      # MorphoPositionValuation without regenerating them leaves the TypeScript differential
+      # tests passing against stale data: the mirror silently stops being checked at all.
+      # Regenerating and diffing is what closes that hole.
+      - name: Golden vectors are up to date
+        if: steps.rpc.outputs.available == 'true'
+        env:
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+        run: |
+          forge test --match-path 'test/vectors/*'
+          if ! git diff --exit-code -- allocator/packages/core/test/vectors allocator/packages/planner/test/vectors; then
+            echo "::error title=Stale golden vectors::The contracts' output no longer matches the committed vectors. Run: forge test --match-path 'test/vectors/*' and commit the result."
+            exit 1
+          fi
+
+  allocator:
+    name: Allocator (TypeScript)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: allocator
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      # gen-abi.ts shells out to `forge build`, so this job needs Foundry too. The ABIs are
+      # generated rather than committed precisely so they cannot drift from the contracts.
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: allocator/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Generate ABIs from forge artifacts
+        run: pnpm --filter @morphoagg/core gen
+
+      # Recursive rather than per-package: pnpm resolves the topological order itself, so
+      # adding a package to the workspace does not also mean editing this file.
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Test
+        run: pnpm -r test
+
+      - name: Build
+        run: pnpm -r build
