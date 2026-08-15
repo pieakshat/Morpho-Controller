@@ -4,7 +4,7 @@ An ERC4626 vault that opens and closes leveraged positions on Morpho Blue using 
 
 ## Status
 
-The contracts and their test suite are complete and passing (129 tests, including fork tests and an adversarial audit suite that both run against real Arbitrum mainnet contracts). The off-chain allocator service that will actually drive the vault day to day has not been built yet. See [Status and roadmap](#status-and-roadmap).
+The contracts and their test suite are complete and passing (143 Solidity tests, including fork tests and an adversarial audit suite that both run against real Arbitrum mainnet contracts), and the deployment scripts have been exercised end to end on an anvil fork. The off-chain allocator service is partially built: `@morphoagg/core` holds the math and valuation mirrors (106 TypeScript tests, checked against the contracts by golden-vector differential tests), while the planner, runtime, and strategies are still to come. See [Allocator service](#allocator-service) and [Status and roadmap](#status-and-roadmap).
 
 ## Overview
 
@@ -232,6 +232,8 @@ test/
                                   Bundler3, and GeneralAdapter1
   audit/                         adversarial tests, one per attack hypothesis, each
                                   either demonstrating a flaw or proving it is blocked
+  vectors/                       dumps the contracts' own output to JSON for the
+                                  off-chain mirror to be checked against
 
 script/
   Config.sol                     shared loader for the chain config JSON
@@ -242,6 +244,9 @@ script/
   config/<chainid>.json          addresses, market params, and risk policy
 
 deployments/<chainid>.json       written by Deploy, read by the allocator service
+
+allocator/                       pnpm workspace for the off-chain side
+  packages/core/                 pure mirrors of the on-chain math, ABIs, schemas
 ```
 
 ## Testing
@@ -325,13 +330,38 @@ forge script script/LocalLoop.s.sol --sig "setup()" --rpc-url http://127.0.0.1:8
 
 A clean round trip at 2x on 100,000 USDC of own capital returns the vault to zero collateral, zero borrow shares, an empty active set, and `totalAssets` within single-digit wei of where it started.
 
+## Allocator service
+
+The off-chain side lives at `allocator/`, a pnpm workspace inside this repo rather than beside it. That placement is deliberate: the ABIs are generated from this tree's own `forge build` artifacts on every build, so the off-chain code physically cannot drift from the contracts it drives.
+
+```shell
+cd allocator && pnpm install
+pnpm --filter @morphoagg/core gen    # forge build, then emit typed ABIs
+pnpm --filter @morphoagg/core test
+```
+
+**`@morphoagg/core`** is the only package so far. It holds the pure mirrors: Morpho's shares math, position valuation, the `totalAssets` formula, and zod schemas for the same JSON files the deploy scripts read. Nothing in it performs I/O. Every function takes chain state as an argument, which is what makes the differential tests below possible and keeps every RPC concern out of the layer that has to be exactly right.
+
+**Why a mirror is needed at all.** `_positionValue` and `_morphoSurplusAndShortfall` are `internal`, and `_planDecrease` / `_planDeleverage` compute amounts the allocator must reproduce byte-for-byte to build valid calldata. A rounding direction flipped in either place does not produce a slightly wrong number; it produces a transaction Morpho rejects with an opaque panic.
+
+**How drift is caught.** `test/vectors/MathVectors.t.sol` and `test/vectors/ValuationVectors.t.sol` dump the contracts' own output to JSON, and the TypeScript suite asserts the mirror reproduces every value exactly. The vectors are committed, so the TypeScript tests need no network. Regenerate them after any change to the math or valuation:
+
+```shell
+forge test --match-path 'test/vectors/*'
+```
+
+**One divergence worth knowing.** `MorphoSharesMath` uses plain `(x * y) / d` to match Morpho Blue's own overflow bounds, and Solidity 0.8 reverts when that product exceeds uint256. TypeScript `bigint` is arbitrary precision and would silently return a value no chain could produce. The mirror therefore reproduces the *failure* as well as the arithmetic: every intermediate Solidity checks is checked there too, and both overflow points of `mulDivUp` are covered, including the second one where the product fits but adding `d - 1` does not. `test_overflowBoundsMatchTheMirror` pins the same inputs on the Solidity side so the parity is verified rather than assumed.
+
+Still to build: the planner (calldata generation), the runtime loop, and strategies. See the tier plan.
+
 ## Status and roadmap
 
 Done:
 - Vault, leverage engine, registry, valuation, swap executor, risk-limit gate, and their tests.
 - Verified against real Arbitrum mainnet Morpho Blue, Bundler3, and GeneralAdapter1 deployments.
+- Config-driven deployment scripts, exercised end to end on an anvil fork.
+- `@morphoagg/core`: the off-chain math and valuation mirrors, checked against the contracts by golden-vector differential tests.
 
 Not built yet:
-- **Off-chain allocator service (Node.js)**. This is the piece that watches vault and market state, decides when and how much to increase or decrease, fetches swap quotes from a DEX aggregator, builds `MarketAction[]` calldata, and calls `executeActions`. The contracts assume this exists and trust it within the bounds of the `enabled` whitelist and the allocator role; none of that decision-making logic lives on-chain today.
-- Deployment scripts (`script/` is currently empty).
+- **The rest of the allocator service.** `core` gives it correct arithmetic; what is still missing is the planner that turns an intent into `MarketAction[]`, a DEX aggregator client for swap quotes, and the runtime that watches state, decides, simulates, signs, and submits. The contracts assume all of this exists and trust it within the bounds of the `enabled` whitelist, the allocator role, and RiskLimits.
 - Any monitoring, alerting, or liquidation-risk tracking for open positions.

@@ -1,0 +1,7 @@
+packages:
+  - "packages/*"
+  - "strategies/*"
+# esbuild ships prebuilt platform binaries and its postinstall selects the right one.
+# vitest and tsx both depend on it, so it has to be allowed to run.
+allowBuilds:
+  esbuild: true

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Generated from forge build artifacts by packages/core/scripts/gen-abi.ts.
+# Not committed: it must always be regenerated from the contracts in this repo, so a stale
+# checked-in copy can never drift from what is actually deployed.
+packages/core/src/abi/generated/
