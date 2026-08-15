@@ -93,7 +93,7 @@ jobs:
       # served almost entirely from disk, which keeps RPC usage near zero and the job fast.
       - name: Cache Foundry RPC responses
         if: steps.rpc.outputs.available == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.foundry/cache/rpc
           key: foundry-rpc-arbitrum-${{ env.FORK_BLOCK }}-${{ hashFiles('test/fork/**', 'test/audit/**', 'test/vectors/ValuationVectors.t.sol', 'test/vectors/PlanVectors.t.sol') }}
