@@ -43,7 +43,7 @@ jobs:
         run: forge build --sizes
 
       - name: Test (offline tiers)
-        run: forge test --match-path 'test/{unit,vectors}/*' --no-match-contract ValuationVectors
+        run: forge test --match-path 'test/{unit,vectors}/*' --no-match-contract 'ValuationVectors|PlanVectors'
 
       # Fuzz tests are excluded: their gas varies with the seed, which would make this flap.
       - name: Gas snapshot
@@ -54,7 +54,7 @@ jobs:
       # secrets and therefore never reach the fork job below.
       - name: Offline golden vectors are up to date
         run: |
-          forge test --match-path 'test/vectors/*' --no-match-contract ValuationVectors
+          forge test --match-path 'test/vectors/*' --no-match-contract 'ValuationVectors|PlanVectors'
           if ! git diff --exit-code -- allocator/packages/core/test/vectors/shares-math.json allocator/packages/planner/test/vectors; then
             echo "::error title=Stale golden vectors::Regenerate with: forge test --match-path 'test/vectors/*'"
             exit 1
@@ -96,7 +96,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.foundry/cache/rpc
-          key: foundry-rpc-arbitrum-${{ env.FORK_BLOCK }}-${{ hashFiles('test/fork/**', 'test/audit/**', 'test/vectors/ValuationVectors.t.sol') }}
+          key: foundry-rpc-arbitrum-${{ env.FORK_BLOCK }}-${{ hashFiles('test/fork/**', 'test/audit/**', 'test/vectors/ValuationVectors.t.sol', 'test/vectors/PlanVectors.t.sol') }}
           restore-keys: |
             foundry-rpc-arbitrum-${{ env.FORK_BLOCK }}-
 
