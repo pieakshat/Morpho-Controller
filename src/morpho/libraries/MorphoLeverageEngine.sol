@@ -108,9 +108,7 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         RISK_LIMITS.checkAfterIncrease(checkParams);
     }
 
-    /// @dev Split out of _increasePosition purely to keep its stack shallow — that function
-    ///      has hit stack-too-deep three times now, and the fix each time was extraction
-    ///      rather than --via-ir.
+    /// @dev Split out of _increasePosition purely to keep its stack shallow
     function _buildIncreaseCheckParams(Id id, MorphoMarketConfig memory config, MarketAction memory action)
         private
         view
@@ -159,7 +157,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         uint256 i;
         nested[i++] = Call({
             to: address(GENERAL_ADAPTER),
-            data: abi.encodeCall(GENERAL_ADAPTER.erc20Transfer, (params.loanToken, address(SWAP_EXECUTOR), totalAmount)),
+            data: abi.encodeCall(
+                GENERAL_ADAPTER.erc20Transfer, (params.loanToken, address(SWAP_EXECUTOR), totalAmount)
+            ),
             value: 0,
             skipRevert: false,
             callbackHash: bytes32(0)
@@ -183,7 +183,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         });
         nested[i++] = Call({
             to: address(GENERAL_ADAPTER),
-            data: abi.encodeCall(GENERAL_ADAPTER.morphoSupplyCollateral, (params, type(uint256).max, address(this), hex"")),
+            data: abi.encodeCall(
+                GENERAL_ADAPTER.morphoSupplyCollateral, (params, type(uint256).max, address(this), hex"")
+            ),
             value: 0,
             skipRevert: false,
             callbackHash: bytes32(0)
@@ -193,7 +195,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                 to: address(GENERAL_ADAPTER),
                 // minSharePriceE27 = 0: the borrow is a deterministic native call with no
                 // slippage risk of its own — the real risk lives in the swap leg above.
-                data: abi.encodeCall(GENERAL_ADAPTER.morphoBorrow, (params, borrowAmount, 0, 0, address(GENERAL_ADAPTER))),
+                data: abi.encodeCall(
+                    GENERAL_ADAPTER.morphoBorrow, (params, borrowAmount, 0, 0, address(GENERAL_ADAPTER))
+                ),
                 value: 0,
                 skipRevert: false,
                 callbackHash: bytes32(0)
@@ -263,7 +267,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             Call[] memory sweep = new Call[](1);
             sweep[0] = Call({
                 to: address(GENERAL_ADAPTER),
-                data: abi.encodeCall(GENERAL_ADAPTER.erc20Transfer, (params.loanToken, address(this), type(uint256).max)),
+                data: abi.encodeCall(
+                    GENERAL_ADAPTER.erc20Transfer, (params.loanToken, address(this), type(uint256).max)
+                ),
                 value: 0,
                 skipRevert: false,
                 callbackHash: bytes32(0)
@@ -290,7 +296,13 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
 
     /// @dev Reads live position/market state and derives the numbers needed to decrease
     ///      the position.
-    function _planDecrease(Id id, uint256 requestedAmount) private returns (DecreasePlan memory plan) {
+    ///
+    ///      `internal` rather than `private` purely so a test harness can reach it. The
+    ///      off-chain planner has to reproduce every number below exactly to build valid
+    ///      calldata, and the only way to hold it to that is to dump this plan's own output
+    ///      as golden vectors. `internal` is still absent from the ABI and still not
+    ///      externally callable, so this widens nothing an attacker can use.
+    function _planDecrease(Id id, uint256 requestedAmount) internal returns (DecreasePlan memory plan) {
         MarketParams memory params = _marketConfigs[id].params;
         MORPHO.accrueInterest(params);
         (, uint128 borrowSharesRaw, uint128 collateralRaw) = MORPHO.position(id, address(this));
@@ -315,7 +327,8 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
                 // Repay by exact shares avoids any dust mismatch from toAssetsUp's
                 // rounding, since Morpho computes the precise asset cost itself.
                 plan.repayShares = borrowSharesRaw;
-                plan.flashloanAmount = MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares);
+                plan.flashloanAmount =
+                    MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares);
             } else {
                 uint256 totalDebt = MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares);
                 plan.repayAssets = (totalDebt * plan.collateralToWithdraw) / collateralRaw;
@@ -332,7 +345,11 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     ///      holding equity constant: newCollateralValue = targetLeverage * equity, so the
     ///      value withdrawn equals the value repaid, no capital in or out beyond that.
     ///      Never a full close — see _decreasePosition's leverage-mode doc.
-    function _planDeleverage(Id id, uint256 targetLeverage) private returns (DecreasePlan memory plan) {
+    ///
+    ///      `internal` rather than `private` for the same reason as _planDecrease above:
+    ///      the off-chain planner mirrors this math, and golden vectors are the only thing
+    ///      that keeps the two from drifting.
+    function _planDeleverage(Id id, uint256 targetLeverage) internal returns (DecreasePlan memory plan) {
         require(targetLeverage >= 1e18, LeverageBelowOneX(targetLeverage));
 
         MarketParams memory params = _marketConfigs[id].params;
@@ -369,7 +386,8 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             repayShares = borrowSharesRaw;
         } else {
             uint256 newDebtValue = newCollateralValue - equity;
-            uint256 targetBorrowShares = MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
+            uint256 targetBorrowShares =
+                MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
             // The up/down rounding chain can still overshoot by a share or two at the
             // margins — clamp rather than let the subtraction below underflow.
             if (targetBorrowShares > borrowSharesRaw) targetBorrowShares = borrowSharesRaw;
@@ -385,7 +403,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         plan.flashloanAmount = MorphoSharesMath.toAssetsUp(repayShares, totalBorrowAssets, totalBorrowShares);
         plan.collateralToWithdraw =
             MorphoSharesMath.mulDivUp(plan.flashloanAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price);
-        require(plan.collateralToWithdraw <= collateralRaw, InvalidDecreaseAmount(plan.collateralToWithdraw, collateralRaw));
+        require(
+            plan.collateralToWithdraw <= collateralRaw, InvalidDecreaseAmount(plan.collateralToWithdraw, collateralRaw)
+        );
     }
 
     /// @dev Builds the nested Call[] for a decrease: repay (if any debt), withdraw
@@ -421,7 +441,8 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         nested[i++] = Call({
             to: address(GENERAL_ADAPTER),
             data: abi.encodeCall(
-                GENERAL_ADAPTER.erc20Transfer, (params.collateralToken, address(SWAP_EXECUTOR), plan.collateralToWithdraw)
+                GENERAL_ADAPTER.erc20Transfer,
+                (params.collateralToken, address(SWAP_EXECUTOR), plan.collateralToWithdraw)
             ),
             value: 0,
             skipRevert: false,
