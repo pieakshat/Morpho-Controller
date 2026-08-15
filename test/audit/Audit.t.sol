@@ -293,7 +293,9 @@ contract AuditTest is Test {
 
         vm.prank(owner);
         try vault.executeActions(actions) {
-            console2.log("partial fill accepted; USDC stranded in executor:", IERC20(USDC).balanceOf(address(swapExecutor)));
+            console2.log(
+                "partial fill accepted; USDC stranded in executor:", IERC20(USDC).balanceOf(address(swapExecutor))
+            );
         } catch {
             console2.log("partial fill reverted (flashloan could not be covered)");
         }

@@ -72,10 +72,7 @@ abstract contract MorphoMarketRegistry {
 
         _isRegistered[id] = true;
         _marketConfigs[id] = MorphoMarketConfig({
-            params: params,
-            maxLeverage: maxLeverage,
-            maxSlippageBps: maxSlippageBps,
-            enabled: true
+            params: params, maxLeverage: maxLeverage, maxSlippageBps: maxSlippageBps, enabled: true
         });
         _registeredMarkets.push(id);
 

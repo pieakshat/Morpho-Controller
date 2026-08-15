@@ -41,9 +41,7 @@ contract MathVectorsTest is Test {
 
     function _push(string memory op, uint256 a, uint256 b, uint256 c, uint256 expected) private {
         lines.push(
-            string.concat(
-                op, ",", vm.toString(a), ",", vm.toString(b), ",", vm.toString(c), ",", vm.toString(expected)
-            )
+            string.concat(op, ",", vm.toString(a), ",", vm.toString(b), ",", vm.toString(c), ",", vm.toString(expected))
         );
     }
 
@@ -96,13 +94,28 @@ contract MathVectorsTest is Test {
         // Oracle pricing, the shape MorphoPositionValuation uses. Price is the live wstETH
         // oracle reading at the pinned block.
         uint256 price = 2_322_919_887_065_307_219_008_086_849;
-        _push("mulDivDown", 86_098_535_344_958_775_195, price, MorphoSharesMath.ORACLE_PRICE_SCALE,
-            MorphoSharesMath.mulDivDown(86_098_535_344_958_775_195, price, MorphoSharesMath.ORACLE_PRICE_SCALE));
-        _push("mulDivDown", 1e18, price, MorphoSharesMath.ORACLE_PRICE_SCALE,
-            MorphoSharesMath.mulDivDown(1e18, price, MorphoSharesMath.ORACLE_PRICE_SCALE));
+        _push(
+            "mulDivDown",
+            86_098_535_344_958_775_195,
+            price,
+            MorphoSharesMath.ORACLE_PRICE_SCALE,
+            MorphoSharesMath.mulDivDown(86_098_535_344_958_775_195, price, MorphoSharesMath.ORACLE_PRICE_SCALE)
+        );
+        _push(
+            "mulDivDown",
+            1e18,
+            price,
+            MorphoSharesMath.ORACLE_PRICE_SCALE,
+            MorphoSharesMath.mulDivDown(1e18, price, MorphoSharesMath.ORACLE_PRICE_SCALE)
+        );
         // Inverse direction, as an increase's minOut floor computes it.
-        _push("mulDivDown", 200_000_000000, MorphoSharesMath.ORACLE_PRICE_SCALE, price,
-            MorphoSharesMath.mulDivDown(200_000_000000, MorphoSharesMath.ORACLE_PRICE_SCALE, price));
+        _push(
+            "mulDivDown",
+            200_000_000000,
+            MorphoSharesMath.ORACLE_PRICE_SCALE,
+            price,
+            MorphoSharesMath.mulDivDown(200_000_000000, MorphoSharesMath.ORACLE_PRICE_SCALE, price)
+        );
 
         string memory obj = "vectors";
         vm.serializeUint(obj, "VIRTUAL_SHARES", MorphoSharesMath.VIRTUAL_SHARES);

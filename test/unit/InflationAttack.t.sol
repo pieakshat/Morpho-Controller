@@ -67,10 +67,7 @@ contract InflationAttackTest is Test {
     uint256 runId;
 
     /// @dev Runs the full sandwich and reports what each side ended up with.
-    function _runAttack(uint256 seed, uint256 donation, uint256 victimDeposit)
-        internal
-        returns (Outcome memory o)
-    {
+    function _runAttack(uint256 seed, uint256 donation, uint256 victimDeposit) internal returns (Outcome memory o) {
         MorphoLeverageVault vault = _newVault();
 
         attacker = address(uint160(uint256(keccak256(abi.encodePacked("attacker", runId)))));
@@ -149,9 +146,7 @@ contract InflationAttackTest is Test {
         // The profit half does not. The attacker holds seed*1000 real shares against 1000
         // virtual shares they can never own, so they redeem roughly half the pot.
         assertLt(o.attackerNet, 0, "attack must not be profitable");
-        assertGt(
-            uint256(-o.attackerNet), VICTIM_DEPOSIT, "attacker should lose more than the victim's entire deposit"
-        );
+        assertGt(uint256(-o.attackerNet), VICTIM_DEPOSIT, "attacker should lose more than the victim's entire deposit");
     }
 
     /// @dev The capital needed to pull off the zero-share case, stated plainly.
@@ -189,9 +184,7 @@ contract InflationAttackTest is Test {
     }
 
     /// @dev The general case: any seed, any donation, any victim size. Nothing profits.
-    function testFuzz_inflationAttack_isNeverProfitable(uint256 seed, uint256 donation, uint256 victimDeposit)
-        public
-    {
+    function testFuzz_inflationAttack_isNeverProfitable(uint256 seed, uint256 donation, uint256 victimDeposit) public {
         seed = bound(seed, 1, 1e12);
         donation = bound(donation, 0, 1e18);
         victimDeposit = bound(victimDeposit, 1e6, 1e15);

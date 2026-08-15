@@ -62,17 +62,29 @@ contract ConfigureRiskLimits is ConfigLoader {
         console2.log("execute in this order; the window must precede any per-market cap");
         console2.log("");
 
-        _log("setRateLimitWindowSeconds", abi.encodeCall(RiskLimits.setRateLimitWindowSeconds, (c.riskLimits.rateLimitWindowSeconds)));
-        _log("setPriceObservationMaxAge", abi.encodeCall(RiskLimits.setPriceObservationMaxAge, (c.riskLimits.priceObservationMaxAge)));
+        _log(
+            "setRateLimitWindowSeconds",
+            abi.encodeCall(RiskLimits.setRateLimitWindowSeconds, (c.riskLimits.rateLimitWindowSeconds))
+        );
+        _log(
+            "setPriceObservationMaxAge",
+            abi.encodeCall(RiskLimits.setPriceObservationMaxAge, (c.riskLimits.priceObservationMaxAge))
+        );
         _log("setMaxAggregateDebt", abi.encodeCall(RiskLimits.setMaxAggregateDebt, (c.riskLimits.maxAggregateDebt)));
-        _log("setMaxSlippageBpsCeiling", abi.encodeCall(RiskLimits.setMaxSlippageBpsCeiling, (c.riskLimits.maxSlippageBpsCeiling)));
+        _log(
+            "setMaxSlippageBpsCeiling",
+            abi.encodeCall(RiskLimits.setMaxSlippageBpsCeiling, (c.riskLimits.maxSlippageBpsCeiling))
+        );
 
         for (uint256 i = 0; i < c.marketCount; ++i) {
             MarketEntry memory m = _loadMarket(json, i);
             Id id = _marketId(m.params);
             console2.log("-- market:", m.name);
             _log("setMinHealthFactor", abi.encodeCall(RiskLimits.setMinHealthFactor, (id, m.minHealthFactor)));
-            _log("setMaxPriceDeviationBps", abi.encodeCall(RiskLimits.setMaxPriceDeviationBps, (id, m.maxPriceDeviationBps)));
+            _log(
+                "setMaxPriceDeviationBps",
+                abi.encodeCall(RiskLimits.setMaxPriceDeviationBps, (id, m.maxPriceDeviationBps))
+            );
             _log(
                 "setMaxExposureChangePerWindow",
                 abi.encodeCall(RiskLimits.setMaxExposureChangePerWindow, (id, m.maxExposureChangePerWindow))

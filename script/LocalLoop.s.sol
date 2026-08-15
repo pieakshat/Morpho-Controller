@@ -107,8 +107,7 @@ contract LocalLoop is ConfigLoader {
             minOut: expectedOut,
             swapTarget: router,
             swapCalldata: abi.encodeCall(
-                MockSwapRouter.swap,
-                (IERC20(m.params.collateralToken), IERC20(m.params.loanToken), uint256(collateral))
+                MockSwapRouter.swap, (IERC20(m.params.collateralToken), IERC20(m.params.loanToken), uint256(collateral))
             )
         });
 

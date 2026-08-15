@@ -5,7 +5,7 @@ pragma solidity 0.8.28;
 /// @dev Value type, not redefinable — this must match the real deployed Morpho Blue exactly.
 type Id is bytes32;
 
-/// @notice One isolated Morpho Blue market. 
+/// @notice One isolated Morpho Blue market.
 struct MarketParams {
     address loanToken;
     address collateralToken;
@@ -16,19 +16,27 @@ struct MarketParams {
 
 /// @notice Minimal interface to the real, immutable Morpho Blue contract.
 /// @dev Verified 2026-08-03 against the deployed contract's own ABI on Arbitrum
-///      (0x6c247b1F6182318877311737BaC0844bAa518F5e), not reconstructed from memory.
+///      (0x6c247b1F6182318877311737BaC0844bAa518F5e).
 ///      Only the functions this project actually calls — Morpho Blue's real surface is larger.
 interface IMorpho {
     /// @notice Grants or revokes `authorized` the right to act on this caller's behalf (onBehalf).
     function setAuthorization(address authorized, bool newIsAuthorized) external;
 
-    function supply(MarketParams memory marketParams, uint256 assets, uint256 shares, address onBehalf, bytes memory data)
-        external
-        returns (uint256 assetsSupplied, uint256 sharesSupplied);
+    function supply(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        bytes memory data
+    ) external returns (uint256 assetsSupplied, uint256 sharesSupplied);
 
-    function withdraw(MarketParams memory marketParams, uint256 assets, uint256 shares, address onBehalf, address receiver)
-        external
-        returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn);
+    function withdraw(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        address receiver
+    ) external returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn);
 
     function supplyCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, bytes memory data)
         external;
@@ -36,13 +44,21 @@ interface IMorpho {
     function withdrawCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, address receiver)
         external;
 
-    function borrow(MarketParams memory marketParams, uint256 assets, uint256 shares, address onBehalf, address receiver)
-        external
-        returns (uint256 assetsBorrowed, uint256 sharesBorrowed);
+    function borrow(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        address receiver
+    ) external returns (uint256 assetsBorrowed, uint256 sharesBorrowed);
 
-    function repay(MarketParams memory marketParams, uint256 assets, uint256 shares, address onBehalf, bytes memory data)
-        external
-        returns (uint256 assetsRepaid, uint256 sharesRepaid);
+    function repay(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        bytes memory data
+    ) external returns (uint256 assetsRepaid, uint256 sharesRepaid);
 
     /// @notice Native flashloan. Morpho calls back into `msg.sender`'s onMorphoFlashLoan(assets, data)
     ///         and expects `assets` of `token` to be returned by the end of that callback.

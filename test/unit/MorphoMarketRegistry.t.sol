@@ -199,8 +199,9 @@ contract MorphoMarketRegistryTest is Test {
         leverage = bound(leverage, 1e18, 1_000e18);
         lltv = bound(lltv, 0, 1e18);
 
-        MarketParams memory params =
-            MarketParams({loanToken: address(asset), collateralToken: collateralToken, oracle: oracle, irm: irm, lltv: lltv});
+        MarketParams memory params = MarketParams({
+            loanToken: address(asset), collateralToken: collateralToken, oracle: oracle, irm: irm, lltv: lltv
+        });
 
         vm.prank(owner);
         Id id = vault.registerMarket(params, leverage, SLIPPAGE_BPS);

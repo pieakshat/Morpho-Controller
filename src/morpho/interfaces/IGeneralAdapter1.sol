@@ -47,6 +47,5 @@ interface IGeneralAdapter1 {
     ) external;
 
     /// @dev No onBehalf — same initiator-resolution note as morphoBorrow.
-    function morphoWithdrawCollateral(MarketParams calldata marketParams, uint256 assets, address receiver)
-        external;
+    function morphoWithdrawCollateral(MarketParams calldata marketParams, uint256 assets, address receiver) external;
 }

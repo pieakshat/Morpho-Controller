@@ -102,7 +102,9 @@ contract RiskLimitsTest is Test {
     }
 
     function _setConfig(Id id, MarketParams memory params) internal {
-        vault.setMarketConfig(id, MorphoMarketConfig({params: params, maxLeverage: 0, maxSlippageBps: 0, enabled: true}));
+        vault.setMarketConfig(
+            id, MorphoMarketConfig({params: params, maxLeverage: 0, maxSlippageBps: 0, enabled: true})
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -438,9 +440,13 @@ contract RiskLimitsTest is Test {
                                 HEALTH FACTOR
     //////////////////////////////////////////////////////////////*/
 
-    function _seedPosition(Id id, uint128 borrowShares, uint128 collateral, uint128 totalBorrowAssets, uint128 totalBorrowShares)
-        internal
-    {
+    function _seedPosition(
+        Id id,
+        uint128 borrowShares,
+        uint128 collateral,
+        uint128 totalBorrowAssets,
+        uint128 totalBorrowShares
+    ) internal {
         morpho.setPosition(id, address(vault), 0, borrowShares, collateral);
         morpho.setMarket(id, 0, 0, totalBorrowAssets, totalBorrowShares);
     }
@@ -538,9 +544,7 @@ contract RiskLimitsTest is Test {
 
         vm.prank(owner);
         limits.setMaxAggregateDebt(totalDebt - 1); // one unit under, must revert
-        vm.expectRevert(
-            abi.encodeWithSelector(RiskLimits.MaxAggregateDebtExceeded.selector, totalDebt, totalDebt - 1)
-        );
+        vm.expectRevert(abi.encodeWithSelector(RiskLimits.MaxAggregateDebtExceeded.selector, totalDebt, totalDebt - 1));
         vault.callCheckAfterIncrease(p);
     }
 
@@ -591,7 +595,9 @@ contract RiskLimitsTest is Test {
         vm.prank(owner);
         limits.setMaxAssetExposure(collateralToken, exposure - 1);
         vm.expectRevert(
-            abi.encodeWithSelector(RiskLimits.MaxAssetExposureExceeded.selector, collateralToken, exposure, exposure - 1)
+            abi.encodeWithSelector(
+                RiskLimits.MaxAssetExposureExceeded.selector, collateralToken, exposure, exposure - 1
+            )
         );
         vault.callCheckAfterIncrease(p);
     }

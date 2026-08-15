@@ -111,10 +111,12 @@ contract MorphoLeverageVaultForkTest is Test {
     ///      shared one instance — the second setRate() call would win for both, since both
     ///      legs' calldata get built before either actually executes. Single-leg tests just
     ///      pass the shared `router`; multi-leg tests must use one instance per leg.
-    function _buildIncreaseSwap(MockSwapRouter targetRouter, address collateralToken, address oracle, uint256 totalAmountUsdc)
-        internal
-        returns (bytes memory data, uint256 expectedOut)
-    {
+    function _buildIncreaseSwap(
+        MockSwapRouter targetRouter,
+        address collateralToken,
+        address oracle,
+        uint256 totalAmountUsdc
+    ) internal returns (bytes memory data, uint256 expectedOut) {
         uint256 price = IOracle(oracle).price();
         uint256 rate = 1e54 / price; // collateralRaw out per usdcRaw in, scaled by 1e18
         targetRouter.setRate(rate);
@@ -130,10 +132,12 @@ contract MorphoLeverageVaultForkTest is Test {
         return _buildIncreaseSwap(router, collateralToken, oracle, totalAmountUsdc);
     }
 
-    function _buildDecreaseSwap(MockSwapRouter targetRouter, address collateralToken, address oracle, uint256 collateralAmount)
-        internal
-        returns (bytes memory data, uint256 expectedOut)
-    {
+    function _buildDecreaseSwap(
+        MockSwapRouter targetRouter,
+        address collateralToken,
+        address oracle,
+        uint256 collateralAmount
+    ) internal returns (bytes memory data, uint256 expectedOut) {
         uint256 price = IOracle(oracle).price();
         uint256 rate = price / 1e18; // usdcRaw out per collateralRaw in, scaled by 1e18
         targetRouter.setRate(rate);
@@ -205,8 +209,7 @@ contract MorphoLeverageVaultForkTest is Test {
         if (borrowSharesRaw > 0) {
             (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = IMorpho(MORPHO).market(id);
             uint256 totalDebt = MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares);
-            flashloanAmount =
-                isFullClose ? totalDebt : (totalDebt * collateralToWithdraw) / uint256(collateralRaw);
+            flashloanAmount = isFullClose ? totalDebt : (totalDebt * collateralToWithdraw) / uint256(collateralRaw);
         }
     }
 
@@ -256,7 +259,8 @@ contract MorphoLeverageVaultForkTest is Test {
             repayShares = borrowSharesRaw;
         } else {
             uint256 newDebtValue = newCollateralValue - equity;
-            uint256 targetBorrowShares = MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
+            uint256 targetBorrowShares =
+                MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
             if (targetBorrowShares > borrowSharesRaw) targetBorrowShares = borrowSharesRaw;
             repayShares = borrowSharesRaw - targetBorrowShares;
         }
@@ -325,9 +329,7 @@ contract MorphoLeverageVaultForkTest is Test {
         // The whole point of the flashloan-atomic design: nothing should be left behind on
         // the shared real adapter or on our own dedicated swap executor.
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
-        assertEq(
-            IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
-        );
+        assertEq(IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
         assertEq(IERC20(USDC).balanceOf(address(swapExecutor)), 0);
         assertEq(IERC20(WSTETH).balanceOf(address(swapExecutor)), 0);
 
@@ -442,17 +444,14 @@ contract MorphoLeverageVaultForkTest is Test {
         uint256 adapterUsdcBefore = IERC20(USDC).balanceOf(GENERAL_ADAPTER);
         uint256 adapterCollateralBefore = IERC20(WETH).balanceOf(GENERAL_ADAPTER);
 
-        uint256 collateralDelivered =
-            _openPositionWithLeverage(wethMarketId, wethParams, WETH_ORACLE, ownAmount, 1e18);
+        uint256 collateralDelivered = _openPositionWithLeverage(wethMarketId, wethParams, WETH_ORACLE, ownAmount, 1e18);
 
         (, uint128 borrowShares, uint128 collateral) = IMorpho(MORPHO).position(wethMarketId, address(vault));
         assertEq(uint256(collateral), collateralDelivered, "all delivered collateral should be supplied");
         assertEq(borrowShares, 0, "1x should never open any debt");
 
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
-        assertEq(
-            IERC20(WETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
-        );
+        assertEq(IERC20(WETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
         assertEq(IERC20(USDC).balanceOf(address(swapExecutor)), 0);
         assertEq(IERC20(WETH).balanceOf(address(swapExecutor)), 0);
 
@@ -483,9 +482,7 @@ contract MorphoLeverageVaultForkTest is Test {
 
         assertGt(IERC20(USDC).balanceOf(address(vault)), idleBefore, "proceeds should land back on the vault");
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
-        assertEq(
-            IERC20(WETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
-        );
+        assertEq(IERC20(WETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
         assertEq(IERC20(USDC).balanceOf(address(swapExecutor)), 0);
         assertEq(IERC20(WETH).balanceOf(address(swapExecutor)), 0);
 
@@ -500,7 +497,8 @@ contract MorphoLeverageVaultForkTest is Test {
 
         _decreasePosition(wstEthMarketId, wstEthParams, withdrawAmount);
 
-        (, uint128 borrowSharesAfter, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        (, uint128 borrowSharesAfter, uint128 collateralAfter) =
+            IMorpho(MORPHO).position(wstEthMarketId, address(vault));
         assertEq(collateralAfter, collateralBefore - withdrawAmount);
         assertGt(borrowSharesAfter, 0, "partial decrease should leave some debt");
 
@@ -520,9 +518,7 @@ contract MorphoLeverageVaultForkTest is Test {
         assertEq(borrowShares, 0, "full close should leave zero debt");
 
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
-        assertEq(
-            IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
-        );
+        assertEq(IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
         assertEq(IERC20(USDC).balanceOf(address(swapExecutor)), 0);
         assertEq(IERC20(WSTETH).balanceOf(address(swapExecutor)), 0);
 
@@ -558,9 +554,7 @@ contract MorphoLeverageVaultForkTest is Test {
         assertApproxEqRel(equityAfter, equityBefore, 0.001e18, "equity should stay roughly constant, self-funded");
 
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
-        assertEq(
-            IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
-        );
+        assertEq(IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
         assertEq(IERC20(USDC).balanceOf(address(swapExecutor)), 0);
         assertEq(IERC20(WSTETH).balanceOf(address(swapExecutor)), 0);
 
@@ -811,16 +805,16 @@ contract MorphoLeverageVaultForkTest is Test {
         assertLe(borrowAmount, (collateralValue * LLTV_86) / 1e18, "position must stay within the real 86% LLTV");
 
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
-        assertEq(
-            IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
-        );
+        assertEq(IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
         assertEq(IERC20(USDC).balanceOf(address(swapExecutor)), 0);
         assertEq(IERC20(WSTETH).balanceOf(address(swapExecutor)), 0);
     }
 
-    function testFuzz_decreasePosition_forAnyValidPartialAmount(uint256 ownAmount, uint256 leverage, uint256 withdrawPct)
-        public
-    {
+    function testFuzz_decreasePosition_forAnyValidPartialAmount(
+        uint256 ownAmount,
+        uint256 leverage,
+        uint256 withdrawPct
+    ) public {
         ownAmount = bound(ownAmount, 1e6, 100_000e6);
         leverage = bound(leverage, 1.01e18, 5e18);
         withdrawPct = bound(withdrawPct, 1, 99); // strictly partial — full close is covered separately
@@ -839,14 +833,14 @@ contract MorphoLeverageVaultForkTest is Test {
 
         (, uint128 borrowSharesAfter, uint128 collateralAfter) =
             IMorpho(MORPHO).position(wstEthMarketId, address(vault));
-        assertEq(collateralAfter, collateralBefore - withdrawAmount, "collateral must drop by exactly the requested amount");
+        assertEq(
+            collateralAfter, collateralBefore - withdrawAmount, "collateral must drop by exactly the requested amount"
+        );
         assertLe(borrowSharesAfter, borrowSharesBefore, "debt must never increase from a decrease");
         assertGt(borrowSharesAfter, 0, "a <100% withdraw of collateral must never fully clear debt");
 
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
-        assertEq(
-            IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust"
-        );
+        assertEq(IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
         assertEq(vault.activeMarkets().length, 1, "partial decrease should never deactivate the market");
     }
 
@@ -905,7 +899,9 @@ contract MorphoLeverageVaultForkTest is Test {
 
         (,, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
         assertEq(
-            collateralAfter, collateralBefore - withdrawAmount, "emergency decrease succeeded despite pause + rate limit"
+            collateralAfter,
+            collateralBefore - withdrawAmount,
+            "emergency decrease succeeded despite pause + rate limit"
         );
     }
 
@@ -915,10 +911,12 @@ contract MorphoLeverageVaultForkTest is Test {
 
     /// @dev Builds an increase swap that deliberately under-delivers by `shortfallBps`
     ///      against the oracle rate, so the trade's realized slippage is a known quantity.
-    function _buildLossyIncreaseSwap(address collateralToken, address oracle, uint256 totalAmountUsdc, uint256 shortfallBps)
-        internal
-        returns (bytes memory data, uint256 delivered)
-    {
+    function _buildLossyIncreaseSwap(
+        address collateralToken,
+        address oracle,
+        uint256 totalAmountUsdc,
+        uint256 shortfallBps
+    ) internal returns (bytes memory data, uint256 delivered) {
         uint256 rate = ((1e54 / IOracle(oracle).price()) * (10_000 - shortfallBps)) / 10_000;
         router.setRate(rate);
         delivered = (totalAmountUsdc * rate) / 1e18;

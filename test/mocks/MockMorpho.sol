@@ -24,15 +24,17 @@ contract MockMorpho is IMorpho {
     mapping(Id => mapping(address => MockPosition)) internal _positions;
     mapping(Id => MockMarket) internal _markets;
 
-    function setPosition(Id id, address user, uint256 supplyShares, uint128 borrowShares, uint128 collateral)
-        external
-    {
+    function setPosition(Id id, address user, uint256 supplyShares, uint128 borrowShares, uint128 collateral) external {
         _positions[id][user] = MockPosition(supplyShares, borrowShares, collateral);
     }
 
-    function setMarket(Id id, uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares)
-        external
-    {
+    function setMarket(
+        Id id,
+        uint128 totalSupplyAssets,
+        uint128 totalSupplyShares,
+        uint128 totalBorrowAssets,
+        uint128 totalBorrowShares
+    ) external {
         _markets[id] = MockMarket(totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares);
     }
 
@@ -74,11 +76,7 @@ contract MockMorpho is IMorpho {
         revert("MockMorpho: unused");
     }
 
-    function borrow(MarketParams memory, uint256, uint256, address, address)
-        external
-        pure
-        returns (uint256, uint256)
-    {
+    function borrow(MarketParams memory, uint256, uint256, address, address) external pure returns (uint256, uint256) {
         revert("MockMorpho: unused");
     }
 

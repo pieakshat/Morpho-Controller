@@ -88,7 +88,9 @@ contract ValuationVectorsTest is Test {
             leverage: leverage,
             minOut: expectedOut,
             swapTarget: address(router),
-            swapCalldata: abi.encodeCall(MockSwapRouter.swap, (IERC20(USDC), IERC20(params.collateralToken), totalAmount))
+            swapCalldata: abi.encodeCall(
+                MockSwapRouter.swap, (IERC20(USDC), IERC20(params.collateralToken), totalAmount)
+            )
         });
         vm.prank(owner);
         vault.executeActions(actions);

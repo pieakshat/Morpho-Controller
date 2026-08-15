@@ -76,7 +76,11 @@ contract MorphoSharesMathTest is Test {
         // On an empty market, the virtual offset alone determines the exchange rate:
         // 1 virtual asset per 1e6 virtual shares.
         assertEq(MorphoSharesMath.toAssetsDown(VIRTUAL_SHARES, 0, 0), VIRTUAL_ASSETS);
-        assertEq(MorphoSharesMath.toAssetsDown(VIRTUAL_SHARES / 2, 0, 0), 0, "half the virtual shares round down to zero assets");
+        assertEq(
+            MorphoSharesMath.toAssetsDown(VIRTUAL_SHARES / 2, 0, 0),
+            0,
+            "half the virtual shares round down to zero assets"
+        );
         assertEq(MorphoSharesMath.toSharesDown(VIRTUAL_ASSETS, 0, 0), VIRTUAL_SHARES);
     }
 

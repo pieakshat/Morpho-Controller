@@ -172,7 +172,8 @@ contract RiskLimits {
 
     function setMaxSlippageBpsCeiling(uint256 ceiling) external onlyOwner {
         require(
-            ceiling <= MAX_SLIPPAGE_BPS_CEILING_LIMIT, InvalidSlippageBpsCeiling(ceiling, MAX_SLIPPAGE_BPS_CEILING_LIMIT)
+            ceiling <= MAX_SLIPPAGE_BPS_CEILING_LIMIT,
+            InvalidSlippageBpsCeiling(ceiling, MAX_SLIPPAGE_BPS_CEILING_LIMIT)
         );
         maxSlippageBpsCeiling = ceiling;
         emit MaxSlippageBpsCeilingUpdated(ceiling);
@@ -229,7 +230,11 @@ contract RiskLimits {
     ///         but as a genuine view call an off-chain allocator can simulate for free instead
     ///         of discovering a revert by broadcasting. Never mutates lastObservedPrice or the
     ///         rate-limit window, unlike the real hook.
-    function previewBeforeIncrease(IncreaseCheckParams calldata p) external view returns (bool ok, bytes4 failureSelector) {
+    function previewBeforeIncrease(IncreaseCheckParams calldata p)
+        external
+        view
+        returns (bool ok, bytes4 failureSelector)
+    {
         try this.evaluateBeforeIncrease(p) {
             return (true, bytes4(0));
         } catch (bytes memory reason) {
@@ -336,7 +341,9 @@ contract RiskLimits {
                 MorphoMarketConfig memory cfg = IVaultMarketsView(VAULT).marketConfig(id);
                 if (cfg.params.collateralToken == p.params.collateralToken) {
                     try IOracle(cfg.params.oracle).price() returns (uint256 price) {
-                        assetExposure += MorphoSharesMath.mulDivDown(collateral, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+                        assetExposure += MorphoSharesMath.mulDivDown(
+                            collateral, price, MorphoSharesMath.ORACLE_PRICE_SCALE
+                        );
                     } catch {}
                 }
             }
