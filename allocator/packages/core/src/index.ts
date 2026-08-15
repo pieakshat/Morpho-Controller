@@ -7,6 +7,13 @@
  * own output, and it keeps every RPC concern in the runtime package.
  */
 
+/**
+ * Generated from this repo's own `forge build` artifacts by scripts/gen-abi.ts, and
+ * gitignored. If this import fails, run `pnpm --filter @morphoagg/core gen` first: the ABIs
+ * are deliberately never committed, so a stale copy cannot drift from the deployed contracts.
+ */
+export { morphoAbi, oracleAbi, riskLimitsAbi, swapExecutorAbi, vaultAbi } from "./abi/generated/index.js";
+
 export {
   MAX_UINT256,
   ORACLE_PRICE_SCALE,
