@@ -25,7 +25,7 @@ struct MorphoMarketConfig {
     bool enabled;
 }
 
-/// @dev Bundles the values CircuitBreaker's increase hooks need, the same way DecreasePlan
+/// @dev Bundles the values RiskLimits's increase hooks need, the same way DecreasePlan
 ///      bundles _decreasePosition's derived numbers — avoids stack-too-deep from passing
 ///      six separate params to two different hook calls, and lets checkBeforeIncrease and
 ///      checkAfterIncrease share the exact same price/slippage numbers the engine itself

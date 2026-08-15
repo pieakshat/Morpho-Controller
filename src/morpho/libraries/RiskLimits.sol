@@ -26,7 +26,7 @@ interface IVaultMarketsView {
 ///      to a single caller. Never decodes MarketAction.swapCalldata and never needs to —
 ///      every check here works off structured inputs the engine already computed
 ///      (IncreaseCheckParams) or live on-chain state, never the opaque swap bytes.
-contract CircuitBreaker {
+contract RiskLimits {
     IMorpho public immutable MORPHO;
     address public immutable VAULT;
 

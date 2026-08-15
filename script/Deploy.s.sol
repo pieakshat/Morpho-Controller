@@ -8,15 +8,15 @@ import {IMorpho, Id} from "../src/morpho/interfaces/IMorpho.sol";
 import {IBundler3} from "../src/morpho/interfaces/IBundler3.sol";
 import {IGeneralAdapter1} from "../src/morpho/interfaces/IGeneralAdapter1.sol";
 import {MorphoLeverageVault} from "../src/morpho/MorphoLeverageVault.sol";
-import {CircuitBreaker} from "../src/morpho/libraries/CircuitBreaker.sol";
+import {RiskLimits} from "../src/morpho/libraries/RiskLimits.sol";
 import {ChainConfig, MarketEntry, ConfigLoader} from "./Config.sol";
 
 /// @notice Deploys and fully configures a MorphoLeverageVault from script/config/<chainid>.json.
 ///
-/// @dev Ownership sequencing is the thing to understand here. CircuitBreaker resolves its
+/// @dev Ownership sequencing is the thing to understand here. RiskLimits resolves its
 ///      admin as IOwnableView(VAULT).owner() at call time, and Ownable sets the owner in the
 ///      vault's constructor. Deploying straight to a multisig would therefore lock this
-///      script out of registerMarket, setAllocator, and every breaker setter. So the vault
+///      script out of registerMarket, setAllocator, and every limits setter. So the vault
 ///      is always deployed owned by the deployer, configured, and only then handed over.
 ///
 ///      The handover cannot complete here either: Ownable2Step requires the incoming owner
@@ -51,26 +51,26 @@ contract Deploy is ConfigLoader {
         MorphoLeverageVault vault = new MorphoLeverageVault(
             IERC20(c.asset), deployer, IMorpho(c.morpho), IBundler3(c.bundler3), IGeneralAdapter1(c.generalAdapter1)
         );
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
 
         vault.setAllocator(allocator, true);
         vault.setActionDropToleranceBps(c.actionDropToleranceBps);
 
-        // Global breaker settings first. The rate-limit window in particular must land
+        // Global limits settings first. The rate-limit window in particular must land
         // before any per-market cap: setMaxExposureChangePerWindow reverts
         // RateLimitWindowNotSet while the window is still zero, because a zero window makes
         // every call look like a fresh period and silently turns a per-window budget into a
         // per-action one.
-        breaker.setRateLimitWindowSeconds(c.breaker.rateLimitWindowSeconds);
-        breaker.setPriceObservationMaxAge(c.breaker.priceObservationMaxAge);
-        breaker.setMaxAggregateDebt(c.breaker.maxAggregateDebt);
-        breaker.setMaxSlippageBpsCeiling(c.breaker.maxSlippageBpsCeiling);
+        limits.setRateLimitWindowSeconds(c.riskLimits.rateLimitWindowSeconds);
+        limits.setPriceObservationMaxAge(c.riskLimits.priceObservationMaxAge);
+        limits.setMaxAggregateDebt(c.riskLimits.maxAggregateDebt);
+        limits.setMaxSlippageBpsCeiling(c.riskLimits.maxSlippageBpsCeiling);
 
         for (uint256 i = 0; i < c.marketCount; ++i) {
-            _registerAndLimit(vault, breaker, _loadMarket(json, i));
+            _registerAndLimit(vault, limits, _loadMarket(json, i));
         }
 
-        if (c.breaker.paused) breaker.setPaused(true);
+        if (c.riskLimits.paused) limits.setPaused(true);
 
         _seed(vault, c);
 
@@ -80,20 +80,20 @@ contract Deploy is ConfigLoader {
 
         vm.stopBroadcast();
 
-        _writeArtifact(json, vault, breaker, c, allocator);
-        _report(json, vault, breaker, c, deployer, allocator, finalOwner);
+        _writeArtifact(json, vault, limits, c, allocator);
+        _report(json, vault, limits, c, deployer, allocator, finalOwner);
     }
 
-    function _registerAndLimit(MorphoLeverageVault vault, CircuitBreaker breaker, MarketEntry memory m) internal {
+    function _registerAndLimit(MorphoLeverageVault vault, RiskLimits limits, MarketEntry memory m) internal {
         Id id = vault.registerMarket(m.params, m.maxLeverage, m.maxSlippageBps);
 
-        breaker.setMinHealthFactor(id, m.minHealthFactor);
-        breaker.setMaxPriceDeviationBps(id, m.maxPriceDeviationBps);
-        breaker.setMaxExposureChangePerWindow(id, m.maxExposureChangePerWindow);
+        limits.setMinHealthFactor(id, m.minHealthFactor);
+        limits.setMaxPriceDeviationBps(id, m.maxPriceDeviationBps);
+        limits.setMaxExposureChangePerWindow(id, m.maxExposureChangePerWindow);
         // Keyed by collateral token, not by market: the cap is the total across every active
         // market sharing that collateral, so two markets on the same asset write the same
         // slot and the last value in the config wins. Intentional, but worth knowing.
-        breaker.setMaxAssetExposure(m.params.collateralToken, m.assetExposureCap);
+        limits.setMaxAssetExposure(m.params.collateralToken, m.assetExposureCap);
     }
 
     /// @dev Shares go to a burn address, never to the deployer. Seeding is what closes the
@@ -111,7 +111,7 @@ contract Deploy is ConfigLoader {
     function _writeArtifact(
         string memory json,
         MorphoLeverageVault vault,
-        CircuitBreaker breaker,
+        RiskLimits limits,
         ChainConfig memory c,
         address allocator
     ) internal {
@@ -126,7 +126,7 @@ contract Deploy is ConfigLoader {
         vm.serializeUint(obj, "chainId", block.chainid);
         vm.serializeAddress(obj, "vault", address(vault));
         vm.serializeAddress(obj, "swapExecutor", vault.swapExecutor());
-        vm.serializeAddress(obj, "circuitBreaker", address(breaker));
+        vm.serializeAddress(obj, "riskLimits", address(limits));
         vm.serializeAddress(obj, "asset", c.asset);
         vm.serializeAddress(obj, "morpho", c.morpho);
         vm.serializeAddress(obj, "bundler3", c.bundler3);
@@ -141,7 +141,7 @@ contract Deploy is ConfigLoader {
     function _report(
         string memory json,
         MorphoLeverageVault vault,
-        CircuitBreaker breaker,
+        RiskLimits limits,
         ChainConfig memory c,
         address deployer,
         address allocator,
@@ -151,7 +151,7 @@ contract Deploy is ConfigLoader {
         console2.log("=== deployed ===");
         console2.log("vault          ", address(vault));
         console2.log("swapExecutor   ", vault.swapExecutor());
-        console2.log("circuitBreaker ", address(breaker));
+        console2.log("riskLimits ", address(limits));
         console2.log("allocator      ", allocator);
         console2.log("owner          ", vault.owner());
         console2.log("artifact       ", _deploymentPath());
@@ -168,7 +168,7 @@ contract Deploy is ConfigLoader {
             console2.log("");
             console2.log("!!! OWNERSHIP TRANSFER IS PENDING, NOT COMPLETE !!!");
             console2.log("Ownable2Step needs the incoming owner to accept before it takes effect.");
-            console2.log("Until then the deployer still owns the vault AND the breaker.");
+            console2.log("Until then the deployer still owns the vault AND RiskLimits.");
             console2.log("  new owner must call vault.acceptOwnership()");
             console2.log("  new owner:", finalOwner);
         }

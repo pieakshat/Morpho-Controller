@@ -150,10 +150,10 @@ contract MorphoLeverageVault is ERC4626, Ownable2Step, ReentrancyGuard, MorphoPo
                                  EMERGENCY
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Force-unwinds a position, bypassing the allocator role and the circuit
-    ///         breaker entirely. The last resort if the allocator is compromised, stuck, or
-    ///         a breaker threshold is itself misconfigured and blocking a real exit — see
-    ///         MorphoLeverageEngine._emergencyDecreasePosition for why the breaker is
+    /// @notice Force-unwinds a position, bypassing the allocator role and RiskLimits
+    ///         entirely. The last resort if the allocator is compromised, stuck, or a
+    ///         risk-limit threshold is itself misconfigured and blocking a real exit — see
+    ///         MorphoLeverageEngine._emergencyDecreasePosition for why RiskLimits is
     ///         skipped rather than just satisfied.
     function emergencyDecrease(MarketAction calldata action) external onlyOwner nonReentrant {
         _emergencyDecreasePosition(action);

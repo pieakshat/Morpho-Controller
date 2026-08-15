@@ -12,7 +12,7 @@
   "asset": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
   "assetDecimals": 6,
 
-  "_marketsComment": "marketCount must match the array length: Foundry has no way to read an array's length from JSON, and struct-decoding an array depends on alphabetical field ordering, which is far more fragile than one explicit number. loanToken must equal asset above or registerMarket reverts LoanTokenMismatch. maxLeverage is a ceiling on what an action may request, not a target. The three breaker fields here are per-market; global ones live under .breaker.",
+  "_marketsComment": "marketCount must match the array length: Foundry has no way to read an array's length from JSON, and struct-decoding an array depends on alphabetical field ordering, which is far more fragile than one explicit number. loanToken must equal asset above or registerMarket reverts LoanTokenMismatch. maxLeverage is a ceiling on what an action may request, not a target. The three risk-limit fields here are per-market; global ones live under .riskLimits.",
   "marketCount": 1,
   "markets": [
     {
@@ -42,8 +42,8 @@
     "actionDropToleranceBps": 100
   },
 
-  "_breakerComment": "Global thresholds only; per-market ones live on each market entry. Every threshold is fail-open: 0 means unenforced. rateLimitWindowSeconds MUST be set before any maxExposureChangePerWindow or the setter reverts RateLimitWindowNotSet, since a zero window silently turns a per-window budget into a per-action one. maxSlippageBpsCeiling bounds slippage a trade actually realized, measured after the fact, so it can sit below a market's own maxSlippageBps.",
-  "breaker": {
+  "_riskLimitsComment": "Global thresholds only; per-market ones live on each market entry. Every threshold is fail-open: 0 means unenforced. rateLimitWindowSeconds MUST be set before any maxExposureChangePerWindow or the setter reverts RateLimitWindowNotSet, since a zero window silently turns a per-window budget into a per-action one. maxSlippageBpsCeiling bounds slippage a trade actually realized, measured after the fact, so it can sit below a market's own maxSlippageBps.",
+  "riskLimits": {
     "paused": false,
     "priceObservationMaxAge": 86400,
     "rateLimitWindowSeconds": 86400,

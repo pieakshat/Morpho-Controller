@@ -13,7 +13,7 @@ import {IOracle} from "../../src/morpho/interfaces/IOracle.sol";
 import {MarketAction} from "../../src/morpho/types/MorphoTypes.sol";
 import {MorphoSharesMath} from "../../src/morpho/libraries/MorphoSharesMath.sol";
 import {MorphoSwapExecutor} from "../../src/morpho/libraries/MorphoSwapExecutor.sol";
-import {CircuitBreaker} from "../../src/morpho/libraries/CircuitBreaker.sol";
+import {RiskLimits} from "../../src/morpho/libraries/RiskLimits.sol";
 import {MorphoLeverageEngine} from "../../src/morpho/libraries/MorphoLeverageEngine.sol";
 import {MorphoLeverageVault} from "../../src/morpho/MorphoLeverageVault.sol";
 import {MockSwapRouter} from "../mocks/MockSwapRouter.sol";
@@ -708,7 +708,7 @@ contract AuditTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-        H14: allocator cannot exceed the circuit breaker's aggregate debt cap
+        H14: allocator cannot exceed the RiskLimits' aggregate debt cap
     //////////////////////////////////////////////////////////////*/
 
     /// @dev maxAggregateDebt caps total debt across every active market in ASSET terms,
@@ -737,9 +737,9 @@ contract AuditTest is Test {
         // Built manually rather than via _openPosition: that helper's own oracle staticcall
         // (to size the swap) would otherwise be "the next call" vm.expectRevert() catches,
         // since it runs before _openPosition ever reaches vault.executeActions.
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
         vm.prank(owner);
-        breaker.setMaxAggregateDebt(ownAmount / 2); // half of what this action's borrow will be
+        limits.setMaxAggregateDebt(ownAmount / 2); // half of what this action's borrow will be
 
         vm.prank(owner);
         vm.expectRevert(); // MaxAggregateDebtExceeded
@@ -747,15 +747,15 @@ contract AuditTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-        H15: pausing the breaker blocks increases, leaves decreases working
+        H15: pausing RiskLimits blocks increases, leaves decreases working
     //////////////////////////////////////////////////////////////*/
 
     function test_H15_pauseBlocksIncreasesLeavesDecreasesWorking() public {
         _openPosition(100_000e6, 2e18);
 
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
         vm.prank(owner);
-        breaker.setPaused(true);
+        limits.setPaused(true);
 
         _decreaseByAmount(1_000e6); // unaffected by pause
 
@@ -781,7 +781,7 @@ contract AuditTest is Test {
         });
 
         vm.prank(owner);
-        vm.expectRevert(CircuitBreaker.Paused.selector);
+        vm.expectRevert(RiskLimits.Paused.selector);
         vault.executeActions(actions);
     }
 
@@ -789,7 +789,7 @@ contract AuditTest is Test {
         H16: only the owner can trigger emergencyDecrease
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev emergencyDecrease bypasses the allocator role and the circuit breaker entirely,
+    /// @dev emergencyDecrease bypasses the allocator role and the risk limits entirely,
     ///      so it must be reachable by the owner alone -- not the allocator, not anyone else.
     function test_H16_emergencyDecreaseIsOwnerOnly() public {
         _openPosition(100_000e6, 2e18);
@@ -827,7 +827,7 @@ contract AuditTest is Test {
         H17: a broken oracle on one active market must not brick increases into another
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Regression test for CircuitBreaker._checkAggregateAndAssetExposure's try/catch:
+    /// @dev Regression test for RiskLimits._checkAggregateAndAssetExposure's try/catch:
     ///      without it, one bad oracle on any active market would block every future
     ///      increase into every market, not just the affected one.
     function test_H17_brokenOracleOnUnrelatedMarketDoesNotBrickHealthyIncrease() public {
@@ -838,7 +838,7 @@ contract AuditTest is Test {
         Id wethMarketId = vault.registerMarket(wethParams, MAX_LEVERAGE_CEILING, SLIPPAGE_BPS);
         // Nonzero so the aggregate loop actually inspects wethMarketId's oracle below,
         // rather than short-circuiting because no exposure cap is configured at all.
-        CircuitBreaker(vault.circuitBreaker()).setMaxAssetExposure(WETH, type(uint256).max);
+        RiskLimits(vault.riskLimits()).setMaxAssetExposure(WETH, type(uint256).max);
         vm.stopPrank();
 
         uint256 wethOwn = 10_000e6;
@@ -869,12 +869,12 @@ contract AuditTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-        H18: ownership transfer carries breaker admin with no separate step
+        H18: ownership transfer carries limits admin with no separate step
     //////////////////////////////////////////////////////////////*/
 
-    function test_H18_ownershipTransferCarriesBreakerAdminWithNoSeparateStep() public {
+    function test_H18_ownershipTransferCarriesRiskLimitsAdminWithNoSeparateStep() public {
         address newOwner = makeAddr("newOwner");
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
 
         vm.prank(owner);
         vault.transferOwnership(newOwner);
@@ -882,12 +882,12 @@ contract AuditTest is Test {
         vault.acceptOwnership();
 
         vm.prank(owner);
-        vm.expectRevert(CircuitBreaker.NotVaultOwner.selector);
-        breaker.setPaused(true);
+        vm.expectRevert(RiskLimits.NotVaultOwner.selector);
+        limits.setPaused(true);
 
         vm.prank(newOwner);
-        breaker.setPaused(true);
-        assertTrue(breaker.paused());
+        limits.setPaused(true);
+        assertTrue(limits.paused());
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -900,12 +900,12 @@ contract AuditTest is Test {
     ///      alone -- see MorphoPositionValuation for how the vault handles a price that
     ///      later turns out to have been wrong (nets the shortfall, doesn't prevent it).
     function test_H19_priceDeviationCatchesAGrossSpikeButIsOnlyASanityCheck() public {
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
         vm.prank(owner);
-        breaker.setMaxPriceDeviationBps(wstEthMarketId, 500); // 5%
+        limits.setMaxPriceDeviationBps(wstEthMarketId, 500); // 5%
 
         _openPosition(1_000e6, 1.5e18); // seeds a baseline observation
-        uint256 baseline = breaker.lastObservedPrice(wstEthMarketId);
+        uint256 baseline = limits.lastObservedPrice(wstEthMarketId);
         console2.log("baseline observed price:", baseline);
 
         uint256 spiked = baseline * 2;

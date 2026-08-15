@@ -79,7 +79,7 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         // compile. slippageBpsUsed is filled in after the bundle runs, since before it there
         // is no realized slippage to report.
         IncreaseCheckParams memory checkParams = _buildIncreaseCheckParams(id, config, action);
-        CIRCUIT_BREAKER.checkBeforeIncrease(checkParams);
+        RISK_LIMITS.checkBeforeIncrease(checkParams);
 
         (,, uint128 collateralBefore) = MORPHO.position(id, address(this));
 
@@ -105,7 +105,7 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         // bounds what a trade is allowed to lose beforehand; this is what it did lose.
         checkParams.slippageBpsUsed =
             _realizedSlippageBps(checkParams.oracleExpectedOut, _collateralGained(id, collateralBefore));
-        CIRCUIT_BREAKER.checkAfterIncrease(checkParams);
+        RISK_LIMITS.checkAfterIncrease(checkParams);
     }
 
     /// @dev Split out of _increasePosition purely to keep its stack shallow — that function
@@ -229,13 +229,13 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     ///      the flashloan can't be covered.
     function _decreasePosition(MarketAction memory action) internal {
         (uint256 unwoundValue, uint256 price) = _decreasePositionCore(action);
-        CIRCUIT_BREAKER.checkAfterDecrease(action.marketId, unwoundValue, price);
+        RISK_LIMITS.checkAfterDecrease(action.marketId, unwoundValue, price);
     }
 
-    /// @dev Same as _decreasePosition but skips CIRCUIT_BREAKER entirely — used only by
+    /// @dev Same as _decreasePosition but skips RISK_LIMITS entirely — used only by
     ///      MorphoLeverageVault.emergencyDecrease. checkAfterDecrease can't revert on its
     ///      current happy path, but an emergency exit's whole job is to survive scenarios
-    ///      other assumptions have broken in; it must not depend on CircuitBreaker being
+    ///      other assumptions have broken in; it must not depend on RiskLimits being
     ///      alive and well, not just on its checks passing.
     function _emergencyDecreasePosition(MarketAction memory action) internal {
         _decreasePositionCore(action);
@@ -250,7 +250,7 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
             action.leverage > 0 ? _planDeleverage(id, action.leverage) : _planDecrease(id, action.amount);
 
         // collateralToken -> loanToken, the opposite direction from an increase, so here
-        // the oracle price applies directly rather than inverted. Also what CircuitBreaker
+        // the oracle price applies directly rather than inverted. Also what RiskLimits
         // sees as this action's exposure change, via checkAfterDecrease above.
         price = IOracle(params.oracle).price();
         unwoundValue =

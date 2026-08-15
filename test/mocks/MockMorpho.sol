@@ -3,9 +3,9 @@ pragma solidity 0.8.28;
 
 import {IMorpho, Id, MarketParams} from "../../src/morpho/interfaces/IMorpho.sol";
 
-/// @notice Settable IMorpho stand-in for unit-testing CircuitBreaker's on-chain-state reads
+/// @notice Settable IMorpho stand-in for unit-testing RiskLimits's on-chain-state reads
 ///         (position/market) without a fork. Every other IMorpho function is left reverting
-///         on purpose — CircuitBreaker never calls them, so a test that reaches one of them
+///         on purpose — RiskLimits never calls them, so a test that reaches one of them
 ///         is exercising something this mock was never meant to support.
 contract MockMorpho is IMorpho {
     struct MockPosition {

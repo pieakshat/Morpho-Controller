@@ -11,7 +11,7 @@ import {IOracle} from "../../src/morpho/interfaces/IOracle.sol";
 import {MarketAction} from "../../src/morpho/types/MorphoTypes.sol";
 import {MorphoSharesMath} from "../../src/morpho/libraries/MorphoSharesMath.sol";
 import {MorphoSwapExecutor} from "../../src/morpho/libraries/MorphoSwapExecutor.sol";
-import {CircuitBreaker} from "../../src/morpho/libraries/CircuitBreaker.sol";
+import {RiskLimits} from "../../src/morpho/libraries/RiskLimits.sol";
 import {MorphoLeverageEngine} from "../../src/morpho/libraries/MorphoLeverageEngine.sol";
 import {MorphoLeverageVault} from "../../src/morpho/MorphoLeverageVault.sol";
 import {MockSwapRouter} from "../mocks/MockSwapRouter.sol";
@@ -854,17 +854,17 @@ contract MorphoLeverageVaultForkTest is Test {
                               CIRCUIT BREAKER
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev emergencyDecrease must survive exactly the scenario it exists for: the breaker
+    /// @dev emergencyDecrease must survive exactly the scenario it exists for: RiskLimits
     ///      paused and a market's rate limit already exhausted, both of which would block a
     ///      normal allocator action -- see MorphoLeverageEngine._emergencyDecreasePosition.
     function test_emergencyDecrease_worksWhilePausedAndRateLimited() public {
         _openPosition(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6);
 
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
         vm.startPrank(owner);
-        breaker.setPaused(true);
-        breaker.setRateLimitWindowSeconds(1 days);
-        breaker.setMaxExposureChangePerWindow(wstEthMarketId, 1); // exhausted by anything real
+        limits.setPaused(true);
+        limits.setRateLimitWindowSeconds(1 days);
+        limits.setMaxExposureChangePerWindow(wstEthMarketId, 1); // exhausted by anything real
         vm.stopPrank();
 
         // Confirm a normal allocator increase is actually blocked, not just theoretically.
@@ -882,10 +882,10 @@ contract MorphoLeverageVaultForkTest is Test {
             swapCalldata: increaseData
         });
         vm.prank(owner);
-        vm.expectRevert(CircuitBreaker.Paused.selector);
+        vm.expectRevert(RiskLimits.Paused.selector);
         vault.executeActions(increaseActions);
 
-        // The owner's emergency exit still works, bypassing the breaker entirely.
+        // The owner's emergency exit still works, bypassing RiskLimits entirely.
         (,, uint128 collateralBefore) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
         uint256 withdrawAmount = uint256(collateralBefore) / 2;
         (bytes memory decreaseData, uint256 decreaseOut) = _buildDecreaseSwap(WSTETH, WSTETH_ORACLE, withdrawAmount);
@@ -947,9 +947,9 @@ contract MorphoLeverageVaultForkTest is Test {
     ///      engine reported the static config value here, so any ceiling below
     ///      SLIPPAGE_BPS rejected every trade including a perfect one.
     function test_slippageCeiling_cleanFillPassesCeilingBelowMarketMax() public {
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
         vm.prank(owner);
-        breaker.setMaxSlippageBpsCeiling(40); // below the market's SLIPPAGE_BPS of 50
+        limits.setMaxSlippageBpsCeiling(40); // below the market's SLIPPAGE_BPS of 50
 
         uint256 ownAmount = 10_000e6;
         (bytes memory data, uint256 expectedOut) =
@@ -964,9 +964,9 @@ contract MorphoLeverageVaultForkTest is Test {
     /// @dev And a fill that really does lose more than the ceiling is rejected, even though
     ///      it clears the market's own oracle floor and would have executed fine before.
     function test_slippageCeiling_lossyFillIsRejectedAfterTheFact() public {
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
         vm.prank(owner);
-        breaker.setMaxSlippageBpsCeiling(20);
+        limits.setMaxSlippageBpsCeiling(20);
 
         uint256 ownAmount = 10_000e6;
         // 45bps of real loss: inside the market's 50bps oracle floor, so minOut passes and
@@ -974,7 +974,7 @@ contract MorphoLeverageVaultForkTest is Test {
         (bytes memory data,) = _buildLossyIncreaseSwap(WSTETH, WSTETH_ORACLE, (ownAmount * LEVERAGE_2X) / 1e18, 45);
 
         // Asserts the measured figure, not just that it reverted: 45 in, 45 reported back.
-        vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.SlippageCeilingExceeded.selector, 45, 20));
+        vm.expectRevert(abi.encodeWithSelector(RiskLimits.SlippageCeilingExceeded.selector, 45, 20));
         _increaseWithSwap(ownAmount, data, 0); // minOut 0 -> defers to the oracle floor
     }
 }

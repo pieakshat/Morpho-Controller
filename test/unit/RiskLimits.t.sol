@@ -8,23 +8,23 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IMorpho, Id, MarketParams} from "../../src/morpho/interfaces/IMorpho.sol";
 import {MorphoMarketConfig, IncreaseCheckParams} from "../../src/morpho/types/MorphoTypes.sol";
 import {MorphoSharesMath} from "../../src/morpho/libraries/MorphoSharesMath.sol";
-import {CircuitBreaker} from "../../src/morpho/libraries/CircuitBreaker.sol";
+import {RiskLimits} from "../../src/morpho/libraries/RiskLimits.sol";
 import {MockMorpho} from "../mocks/MockMorpho.sol";
 import {MockOracle} from "../mocks/MockOracle.sol";
 
-/// @dev Stands in for MorphoLeverageVault: deploys its own CircuitBreaker exactly like
+/// @dev Stands in for MorphoLeverageVault: deploys its own RiskLimits exactly like
 ///      MorphoCore does, exposes Ownable2Step so ownership-transfer behavior is real, and
-///      exposes the IVaultMarketsView surface (activeMarkets/marketConfig) the breaker reads
+///      exposes the IVaultMarketsView surface (activeMarkets/marketConfig) RiskLimits reads
 ///      back. Relay functions mirror the exact calls MorphoLeverageEngine makes, so
-///      msg.sender inside CircuitBreaker is this contract, same as in production.
+///      msg.sender inside RiskLimits is this contract, same as in production.
 contract MockVault is Ownable2Step {
-    CircuitBreaker public immutable BREAKER;
+    RiskLimits public immutable BREAKER;
 
     mapping(Id => MorphoMarketConfig) internal _configs;
     Id[] internal _active;
 
     constructor(IMorpho morpho_, address owner_) Ownable(owner_) {
-        BREAKER = new CircuitBreaker(morpho_);
+        BREAKER = new RiskLimits(morpho_);
     }
 
     function setMarketConfig(Id id, MorphoMarketConfig calldata cfg) external {
@@ -59,10 +59,10 @@ contract MockVault is Ownable2Step {
     }
 }
 
-contract CircuitBreakerTest is Test {
+contract RiskLimitsTest is Test {
     MockMorpho morpho;
     MockVault vault;
-    CircuitBreaker breaker;
+    RiskLimits limits;
     MockOracle oracle;
 
     address owner = makeAddr("owner");
@@ -74,7 +74,7 @@ contract CircuitBreakerTest is Test {
     function setUp() public {
         morpho = new MockMorpho();
         vault = new MockVault(IMorpho(address(morpho)), owner);
-        breaker = vault.BREAKER();
+        limits = vault.BREAKER();
         oracle = new MockOracle();
         oracle.setPrice(1e36);
     }
@@ -110,8 +110,8 @@ contract CircuitBreakerTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_constructor_setsVaultAndMorpho() public view {
-        assertEq(breaker.VAULT(), address(vault));
-        assertEq(address(breaker.MORPHO()), address(morpho));
+        assertEq(limits.VAULT(), address(vault));
+        assertEq(address(limits.MORPHO()), address(morpho));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -120,14 +120,14 @@ contract CircuitBreakerTest is Test {
 
     function test_onlyOwner_revertsForStranger() public {
         vm.prank(stranger);
-        vm.expectRevert(CircuitBreaker.NotVaultOwner.selector);
-        breaker.setPaused(true);
+        vm.expectRevert(RiskLimits.NotVaultOwner.selector);
+        limits.setPaused(true);
     }
 
     function test_onlyOwner_acceptsDirectOwnerCall() public {
         vm.prank(owner);
-        breaker.setPaused(true);
-        assertTrue(breaker.paused());
+        limits.setPaused(true);
+        assertTrue(limits.paused());
     }
 
     /// @dev The vault itself is NOT an admin. Accepting it would authorize every present and
@@ -135,11 +135,11 @@ contract CircuitBreakerTest is Test {
     ///      can call these directly, as the test above shows.
     function test_onlyOwner_rejectsTheVaultItself() public {
         vm.prank(address(vault));
-        vm.expectRevert(CircuitBreaker.NotVaultOwner.selector);
-        breaker.setPaused(true);
+        vm.expectRevert(RiskLimits.NotVaultOwner.selector);
+        limits.setPaused(true);
     }
 
-    function test_ownershipTransfer_carriesBreakerAdminWithNoBreakerSideStep() public {
+    function test_ownershipTransfer_carriesRiskLimitsAdminWithNoSeparateRiskLimitsStep() public {
         address newOwner = makeAddr("newOwner");
 
         vm.prank(owner);
@@ -148,32 +148,32 @@ contract CircuitBreakerTest is Test {
         vault.acceptOwnership();
 
         vm.prank(owner);
-        vm.expectRevert(CircuitBreaker.NotVaultOwner.selector);
-        breaker.setPaused(true);
+        vm.expectRevert(RiskLimits.NotVaultOwner.selector);
+        limits.setPaused(true);
 
         vm.prank(newOwner);
-        breaker.setPaused(true);
-        assertTrue(breaker.paused());
+        limits.setPaused(true);
+        assertTrue(limits.paused());
     }
 
     function test_onlyVault_revertsForNonVaultCaller() public {
         IncreaseCheckParams memory p = _params();
 
-        vm.expectRevert(CircuitBreaker.NotVault.selector);
-        breaker.checkBeforeIncrease(p);
+        vm.expectRevert(RiskLimits.NotVault.selector);
+        limits.checkBeforeIncrease(p);
 
-        vm.expectRevert(CircuitBreaker.NotVault.selector);
-        breaker.checkAfterIncrease(p);
+        vm.expectRevert(RiskLimits.NotVault.selector);
+        limits.checkAfterIncrease(p);
 
-        vm.expectRevert(CircuitBreaker.NotVault.selector);
-        breaker.checkAfterDecrease(marketId, 1, 1e36);
+        vm.expectRevert(RiskLimits.NotVault.selector);
+        limits.checkAfterDecrease(marketId, 1, 1e36);
     }
 
     /*//////////////////////////////////////////////////////////////
                                 PAUSE
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev No per-market setup at all: a market the breaker has never heard of is usable by
+    /// @dev No per-market setup at all: a market RiskLimits has never heard of is usable by
     ///      default, since MorphoMarketRegistry -- not this contract -- decides which
     ///      markets and leverage are allowed at all. Everything here is opt-in risk limits
     ///      layered on top of that, not a second gate to unlock first.
@@ -183,17 +183,17 @@ contract CircuitBreakerTest is Test {
 
     function test_paused_blocksCheckBeforeIncrease() public {
         vm.prank(owner);
-        breaker.setPaused(true);
+        limits.setPaused(true);
 
-        vm.expectRevert(CircuitBreaker.Paused.selector);
+        vm.expectRevert(RiskLimits.Paused.selector);
         vault.callCheckBeforeIncrease(_params());
     }
 
     function test_paused_doesNotBlockCheckAfterDecrease() public {
         vm.prank(owner);
-        breaker.setPaused(true);
+        limits.setPaused(true);
 
-        // Must not revert -- decreases are never blockable by the breaker.
+        // Must not revert -- decreases are never blockable by RiskLimits.
         vault.callCheckAfterDecrease(marketId, 1_000e6, 1e36);
     }
 
@@ -203,15 +203,15 @@ contract CircuitBreakerTest is Test {
 
     function test_priceDeviation_firstObservationAlwaysPasses() public {
         vm.prank(owner);
-        breaker.setMaxPriceDeviationBps(marketId, 100); // 1%
+        limits.setMaxPriceDeviationBps(marketId, 100); // 1%
 
         vault.callCheckBeforeIncrease(_params());
-        assertEq(breaker.lastObservedPrice(marketId), 1e36);
+        assertEq(limits.lastObservedPrice(marketId), 1e36);
     }
 
     function test_priceDeviation_atBoundaryPasses() public {
         vm.prank(owner);
-        breaker.setMaxPriceDeviationBps(marketId, 100); // 1%
+        limits.setMaxPriceDeviationBps(marketId, 100); // 1%
 
         vault.callCheckBeforeIncrease(_params()); // seeds lastObservedPrice = 1e36
 
@@ -222,7 +222,7 @@ contract CircuitBreakerTest is Test {
 
     function test_priceDeviation_beyondBoundaryReverts() public {
         vm.prank(owner);
-        breaker.setMaxPriceDeviationBps(marketId, 100); // 1%
+        limits.setMaxPriceDeviationBps(marketId, 100); // 1%
 
         vault.callCheckBeforeIncrease(_params()); // seeds lastObservedPrice = 1e36
 
@@ -232,7 +232,7 @@ contract CircuitBreakerTest is Test {
         IncreaseCheckParams memory p = _params();
         p.price = 1e36 + (1e36 / 100) + 1;
         vm.expectRevert(
-            abi.encodeWithSelector(CircuitBreaker.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
+            abi.encodeWithSelector(RiskLimits.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
         );
         vault.callCheckBeforeIncrease(p);
     }
@@ -247,8 +247,8 @@ contract CircuitBreakerTest is Test {
 
     function test_setMaxPriceDeviationBps_revertsAboveLimit() public {
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.InvalidPriceDeviationBps.selector, 10_001, 10_000));
-        breaker.setMaxPriceDeviationBps(marketId, 10_001);
+        vm.expectRevert(abi.encodeWithSelector(RiskLimits.InvalidPriceDeviationBps.selector, 10_001, 10_000));
+        limits.setMaxPriceDeviationBps(marketId, 10_001);
     }
 
     /// @dev A stale anchor measures cumulative drift, not a break. Comparing against a
@@ -257,8 +257,8 @@ contract CircuitBreakerTest is Test {
     ///      threshold -- defeats the check. Past maxAge the anchor is ignored instead.
     function test_priceDeviation_staleAnchorIsIgnored() public {
         vm.startPrank(owner);
-        breaker.setMaxPriceDeviationBps(marketId, 100); // 1%
-        breaker.setPriceObservationMaxAge(1 days);
+        limits.setMaxPriceDeviationBps(marketId, 100); // 1%
+        limits.setPriceObservationMaxAge(1 days);
         vm.stopPrank();
 
         vault.callCheckBeforeIncrease(_params()); // anchor at 1e36, now
@@ -268,21 +268,21 @@ contract CircuitBreakerTest is Test {
 
         // Still fresh: correctly rejected.
         vm.expectRevert(
-            abi.encodeWithSelector(CircuitBreaker.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
+            abi.encodeWithSelector(RiskLimits.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
         );
         vault.callCheckBeforeIncrease(p);
 
-        // Same drift, but the anchor has aged out. Gradual drift is not a circuit-breaker
+        // Same drift, but the anchor has aged out. Gradual drift is not a risk-limit
         // event, so this must pass.
         vm.warp(block.timestamp + 1 days + 1);
         vault.callCheckBeforeIncrease(p);
-        assertEq(breaker.lastObservedPrice(marketId), p.price, "anchor re-seeded at the new price");
+        assertEq(limits.lastObservedPrice(marketId), p.price, "anchor re-seeded at the new price");
     }
 
     /// @dev maxAge of 0 keeps the old always-compare behavior.
     function test_priceDeviation_maxAgeZeroNeverExpires() public {
         vm.prank(owner);
-        breaker.setMaxPriceDeviationBps(marketId, 100);
+        limits.setMaxPriceDeviationBps(marketId, 100);
 
         vault.callCheckBeforeIncrease(_params());
 
@@ -290,7 +290,7 @@ contract CircuitBreakerTest is Test {
         IncreaseCheckParams memory p = _params();
         p.price = 1e36 * 2;
         vm.expectRevert(
-            abi.encodeWithSelector(CircuitBreaker.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
+            abi.encodeWithSelector(RiskLimits.PriceDeviationExceeded.selector, marketId, p.price, 1e36, 100)
         );
         vault.callCheckBeforeIncrease(p);
     }
@@ -301,8 +301,8 @@ contract CircuitBreakerTest is Test {
 
     function test_rateLimit_accumulatesWithinWindowAndReverts() public {
         vm.startPrank(owner);
-        breaker.setRateLimitWindowSeconds(1 hours);
-        breaker.setMaxExposureChangePerWindow(marketId, 150e6);
+        limits.setRateLimitWindowSeconds(1 hours);
+        limits.setMaxExposureChangePerWindow(marketId, 150e6);
         vm.stopPrank();
 
         IncreaseCheckParams memory p = _params();
@@ -313,14 +313,14 @@ contract CircuitBreakerTest is Test {
         vault.callCheckBeforeIncrease(p); // window now at 150e6, exactly the cap
 
         p.totalAmount = 1;
-        vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.RateLimitExceeded.selector, marketId, 150e6 + 1, 150e6));
+        vm.expectRevert(abi.encodeWithSelector(RiskLimits.RateLimitExceeded.selector, marketId, 150e6 + 1, 150e6));
         vault.callCheckBeforeIncrease(p);
     }
 
     function test_rateLimit_windowResetsAfterWarp() public {
         vm.startPrank(owner);
-        breaker.setRateLimitWindowSeconds(1 hours);
-        breaker.setMaxExposureChangePerWindow(marketId, 100e6);
+        limits.setRateLimitWindowSeconds(1 hours);
+        limits.setMaxExposureChangePerWindow(marketId, 100e6);
         vm.stopPrank();
 
         IncreaseCheckParams memory p = _params();
@@ -335,8 +335,8 @@ contract CircuitBreakerTest is Test {
     ///      again right after the next one starts can admit close to 2x the nominal cap.
     function test_rateLimit_boundaryBurstIsPossibleByDesign() public {
         vm.startPrank(owner);
-        breaker.setRateLimitWindowSeconds(1 hours);
-        breaker.setMaxExposureChangePerWindow(marketId, 100e6);
+        limits.setRateLimitWindowSeconds(1 hours);
+        limits.setMaxExposureChangePerWindow(marketId, 100e6);
         vm.stopPrank();
 
         IncreaseCheckParams memory p = _params();
@@ -358,22 +358,22 @@ contract CircuitBreakerTest is Test {
     ///      turn a per-window budget into a per-action one. Rejected at the setter instead.
     function test_setMaxExposureChangePerWindow_revertsWhenWindowUnset() public {
         vm.prank(owner);
-        vm.expectRevert(CircuitBreaker.RateLimitWindowNotSet.selector);
-        breaker.setMaxExposureChangePerWindow(marketId, 100e6);
+        vm.expectRevert(RiskLimits.RateLimitWindowNotSet.selector);
+        limits.setMaxExposureChangePerWindow(marketId, 100e6);
     }
 
     function test_setMaxExposureChangePerWindow_zeroCapAllowedWithoutWindow() public {
         vm.prank(owner);
-        breaker.setMaxExposureChangePerWindow(marketId, 0); // clearing is always fine
+        limits.setMaxExposureChangePerWindow(marketId, 0); // clearing is always fine
     }
 
     /// @dev Clearing the window afterwards disables rate limiting rather than reverting to
     ///      per-action semantics.
     function test_rateLimit_disabledWhenWindowClearedAfterCapSet() public {
         vm.startPrank(owner);
-        breaker.setRateLimitWindowSeconds(1 hours);
-        breaker.setMaxExposureChangePerWindow(marketId, 100e6);
-        breaker.setRateLimitWindowSeconds(0);
+        limits.setRateLimitWindowSeconds(1 hours);
+        limits.setMaxExposureChangePerWindow(marketId, 100e6);
+        limits.setRateLimitWindowSeconds(0);
         vm.stopPrank();
 
         IncreaseCheckParams memory p = _params();
@@ -394,30 +394,30 @@ contract CircuitBreakerTest is Test {
     ///      re-entering the market it had just made safer.
     function test_decreaseReleasesBudgetInsteadOfConsumingIt() public {
         vm.startPrank(owner);
-        breaker.setRateLimitWindowSeconds(1 days);
-        breaker.setMaxExposureChangePerWindow(marketId, 1_000_000e6);
+        limits.setRateLimitWindowSeconds(1 days);
+        limits.setMaxExposureChangePerWindow(marketId, 1_000_000e6);
         vm.stopPrank();
 
         IncreaseCheckParams memory p = _params();
         p.totalAmount = 900_000e6;
         vault.callCheckBeforeIncrease(p);
-        assertEq(breaker.windowExposureChange(marketId), 900_000e6, "increase consumes budget");
+        assertEq(limits.windowExposureChange(marketId), 900_000e6, "increase consumes budget");
 
         // Unwind most of it back out.
         vault.callCheckAfterDecrease(marketId, 800_000e6, 1e36);
-        assertEq(breaker.windowExposureChange(marketId), 100_000e6, "unwind returns budget");
+        assertEq(limits.windowExposureChange(marketId), 100_000e6, "unwind returns budget");
 
         // Re-entry that would have been blocked before now fits.
         p.totalAmount = 200_000e6;
-        (bool ok,) = breaker.previewBeforeIncrease(p);
+        (bool ok,) = limits.previewBeforeIncrease(p);
         assertTrue(ok, "de-risking must not lock out re-entry");
     }
 
     /// @dev Saturates at zero rather than wrapping, since this path must never revert.
     function test_decreaseLargerThanWindowSaturatesAtZero() public {
         vm.startPrank(owner);
-        breaker.setRateLimitWindowSeconds(1 days);
-        breaker.setMaxExposureChangePerWindow(marketId, 1_000_000e6);
+        limits.setRateLimitWindowSeconds(1 days);
+        limits.setMaxExposureChangePerWindow(marketId, 1_000_000e6);
         vm.stopPrank();
 
         IncreaseCheckParams memory p = _params();
@@ -425,13 +425,13 @@ contract CircuitBreakerTest is Test {
         vault.callCheckBeforeIncrease(p);
 
         vault.callCheckAfterDecrease(marketId, type(uint256).max, 1e36);
-        assertEq(breaker.windowExposureChange(marketId), 0);
+        assertEq(limits.windowExposureChange(marketId), 0);
     }
 
     function test_decreaseRefreshesThePriceAnchor() public {
         vault.callCheckAfterDecrease(marketId, 1e6, 2e36);
-        assertEq(breaker.lastObservedPrice(marketId), 2e36);
-        assertEq(breaker.lastObservedAt(marketId), block.timestamp);
+        assertEq(limits.lastObservedPrice(marketId), 2e36);
+        assertEq(limits.lastObservedAt(marketId), block.timestamp);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -449,7 +449,7 @@ contract CircuitBreakerTest is Test {
         _seedPosition(marketId, 0, 100e18, 0, 0);
         _setConfig(marketId, _marketParams(0.8e18));
 
-        assertEq(breaker.healthFactor(marketId), type(uint256).max);
+        assertEq(limits.healthFactor(marketId), type(uint256).max);
     }
 
     function test_healthFactor_view_matchesFormula() public {
@@ -467,7 +467,7 @@ contract CircuitBreakerTest is Test {
         uint256 collateralValue = MorphoSharesMath.mulDivDown(collateral, 1e24, MorphoSharesMath.ORACLE_PRICE_SCALE);
         uint256 expected = (collateralValue * lltv) / debtValue;
 
-        assertEq(breaker.healthFactor(marketId), expected);
+        assertEq(limits.healthFactor(marketId), expected);
     }
 
     function test_checkAfterIncrease_healthFactor_passesAtFloor_revertsOneWeiAbove() public {
@@ -489,12 +489,12 @@ contract CircuitBreakerTest is Test {
         p.params = _marketParams(lltv);
 
         vm.prank(owner);
-        breaker.setMinHealthFactor(marketId, hf); // exactly at the floor, must pass
+        limits.setMinHealthFactor(marketId, hf); // exactly at the floor, must pass
         vault.callCheckAfterIncrease(p);
 
         vm.prank(owner);
-        breaker.setMinHealthFactor(marketId, hf + 1); // one wei above actual HF, must revert
-        vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.HealthFactorTooLow.selector, marketId, hf, hf + 1));
+        limits.setMinHealthFactor(marketId, hf + 1); // one wei above actual HF, must revert
+        vm.expectRevert(abi.encodeWithSelector(RiskLimits.HealthFactorTooLow.selector, marketId, hf, hf + 1));
         vault.callCheckAfterIncrease(p);
     }
 
@@ -533,13 +533,13 @@ contract CircuitBreakerTest is Test {
         p.params = _marketParams(0.8e18);
 
         vm.prank(owner);
-        breaker.setMaxAggregateDebt(totalDebt); // exactly at the cap, must pass
+        limits.setMaxAggregateDebt(totalDebt); // exactly at the cap, must pass
         vault.callCheckAfterIncrease(p);
 
         vm.prank(owner);
-        breaker.setMaxAggregateDebt(totalDebt - 1); // one unit under, must revert
+        limits.setMaxAggregateDebt(totalDebt - 1); // one unit under, must revert
         vm.expectRevert(
-            abi.encodeWithSelector(CircuitBreaker.MaxAggregateDebtExceeded.selector, totalDebt, totalDebt - 1)
+            abi.encodeWithSelector(RiskLimits.MaxAggregateDebtExceeded.selector, totalDebt, totalDebt - 1)
         );
         vault.callCheckAfterIncrease(p);
     }
@@ -585,13 +585,13 @@ contract CircuitBreakerTest is Test {
         IncreaseCheckParams memory p = _params();
 
         vm.prank(owner);
-        breaker.setMaxAssetExposure(collateralToken, exposure); // exactly at the cap, passes
+        limits.setMaxAssetExposure(collateralToken, exposure); // exactly at the cap, passes
         vault.callCheckAfterIncrease(p);
 
         vm.prank(owner);
-        breaker.setMaxAssetExposure(collateralToken, exposure - 1);
+        limits.setMaxAssetExposure(collateralToken, exposure - 1);
         vm.expectRevert(
-            abi.encodeWithSelector(CircuitBreaker.MaxAssetExposureExceeded.selector, collateralToken, exposure, exposure - 1)
+            abi.encodeWithSelector(RiskLimits.MaxAssetExposureExceeded.selector, collateralToken, exposure, exposure - 1)
         );
         vault.callCheckAfterIncrease(p);
     }
@@ -631,7 +631,7 @@ contract CircuitBreakerTest is Test {
         p.marketId = healthyMarket;
 
         vm.prank(owner);
-        breaker.setMaxAssetExposure(collateralToken, 100e18); // only the healthy market's 100e18 should count
+        limits.setMaxAssetExposure(collateralToken, 100e18); // only the healthy market's 100e18 should count
 
         vault.callCheckAfterIncrease(p); // must not revert: broken oracle degrades to zero
     }
@@ -647,19 +647,19 @@ contract CircuitBreakerTest is Test {
         p.slippageBpsUsed = 100;
 
         vm.prank(owner);
-        breaker.setMaxSlippageBpsCeiling(100);
+        limits.setMaxSlippageBpsCeiling(100);
         vault.callCheckAfterIncrease(p); // exactly at the ceiling, passes
 
         vm.prank(owner);
-        breaker.setMaxSlippageBpsCeiling(99);
-        vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.SlippageCeilingExceeded.selector, 100, 99));
+        limits.setMaxSlippageBpsCeiling(99);
+        vm.expectRevert(abi.encodeWithSelector(RiskLimits.SlippageCeilingExceeded.selector, 100, 99));
         vault.callCheckAfterIncrease(p);
     }
 
     function test_setMaxSlippageBpsCeiling_revertsAboveLimit() public {
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(CircuitBreaker.InvalidSlippageBpsCeiling.selector, 1_001, 1_000));
-        breaker.setMaxSlippageBpsCeiling(1_001);
+        vm.expectRevert(abi.encodeWithSelector(RiskLimits.InvalidSlippageBpsCeiling.selector, 1_001, 1_000));
+        limits.setMaxSlippageBpsCeiling(1_001);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -668,16 +668,16 @@ contract CircuitBreakerTest is Test {
 
     function test_previewBeforeIncrease_matchesRealCheck() public {
         vm.prank(owner);
-        breaker.setPaused(true);
+        limits.setPaused(true);
 
-        (bool okPaused, bytes4 selPaused) = breaker.previewBeforeIncrease(_params());
+        (bool okPaused, bytes4 selPaused) = limits.previewBeforeIncrease(_params());
         assertFalse(okPaused);
-        assertEq(selPaused, CircuitBreaker.Paused.selector);
+        assertEq(selPaused, RiskLimits.Paused.selector);
 
         vm.prank(owner);
-        breaker.setPaused(false);
+        limits.setPaused(false);
 
-        (bool okAfter, bytes4 selAfter) = breaker.previewBeforeIncrease(_params());
+        (bool okAfter, bytes4 selAfter) = limits.previewBeforeIncrease(_params());
         assertTrue(okAfter);
         assertEq(selAfter, bytes4(0));
 
@@ -687,12 +687,12 @@ contract CircuitBreakerTest is Test {
 
     function test_previewBeforeIncrease_neverMutatesState() public {
         vm.prank(owner);
-        breaker.setMaxPriceDeviationBps(marketId, 100);
+        limits.setMaxPriceDeviationBps(marketId, 100);
 
-        breaker.previewBeforeIncrease(_params());
-        breaker.previewBeforeIncrease(_params());
+        limits.previewBeforeIncrease(_params());
+        limits.previewBeforeIncrease(_params());
 
-        assertEq(breaker.lastObservedPrice(marketId), 0);
-        assertEq(breaker.windowExposureChange(marketId), 0);
+        assertEq(limits.lastObservedPrice(marketId), 0);
+        assertEq(limits.windowExposureChange(marketId), 0);
     }
 }

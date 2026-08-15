@@ -14,7 +14,7 @@ Leverage is achieved through a single atomic flashloan rather than repeated supp
 
 Swaps are done through an arbitrary external venue supplied by the allocator (a DEX aggregator quote, typically). The vault does not pick the route, but it does refuse any fill that lands too far below the market oracle's price. See [Safety model](#safety-model).
 
-A separate `CircuitBreaker` contract adds owner-configurable risk limits on top of what the registry already gates — minimum health factor, aggregate debt and per-asset exposure caps, price-deviation sanity checks, and rate limiting — and gives the owner an emergency exit that works even if the breaker itself is misconfigured. See [Circuit breaker](#circuit-breaker).
+A separate `RiskLimits` contract adds owner-configurable risk limits on top of what the registry already gates — minimum health factor, aggregate debt and per-asset exposure caps, price-deviation sanity checks, and rate limiting — and gives the owner an emergency exit that works even if RiskLimits itself is misconfigured. See [Risk limits](#risk-limits).
 
 ## Architecture
 
@@ -25,11 +25,11 @@ flowchart TD
     Vault["MorphoLeverageVault<br/>ERC4626 share token, entry point"]
     Vault --> Engine["MorphoLeverageEngine<br/>increase / decrease logic"]
     Vault --> Valuation["MorphoPositionValuation<br/>totalAssets from live Morpho state"]
-    Engine --> Core["MorphoCore<br/>Morpho, Bundler3, GeneralAdapter1, SwapExecutor, CircuitBreaker refs"]
+    Engine --> Core["MorphoCore<br/>Morpho, Bundler3, GeneralAdapter1, SwapExecutor, RiskLimits refs"]
     Engine --> Registry["MorphoMarketRegistry<br/>market whitelist and active set"]
     Engine --> SharesMath["MorphoSharesMath<br/>shares/assets conversion"]
     Engine --> SwapExec["MorphoSwapExecutor<br/>slippage-checked swap"]
-    Engine --> Breaker["CircuitBreaker<br/>risk-limit gate and emergency pause"]
+    Engine --> Limits["RiskLimits<br/>risk-limit gate and emergency pause"]
     Valuation --> Core
     Valuation --> Registry
 ```
@@ -40,7 +40,7 @@ flowchart TD
 - **MorphoPositionValuation**: reads live Morpho state to value every active position, which feeds `totalAssets` and therefore share pricing.
 - **MorphoSharesMath**: Morpho Blue's own shares/assets conversion math, reimplemented locally so this project has no dependency on the Morpho Blue repo.
 - **MorphoSwapExecutor**: a small standalone contract that executes one swap through an arbitrary target and enforces a minimum output.
-- **CircuitBreaker**: a second, independently-configurable risk-limit gate the engine consults on every action. See [Circuit breaker](#circuit-breaker).
+- **RiskLimits**: a second, independently-configurable risk-limit gate the engine consults on every action. See [Risk limits](#risk-limits).
 
 ## Actors and system flow
 
@@ -48,9 +48,9 @@ flowchart TD
 flowchart LR
     Depositor(["Depositor"]) -->|deposit / withdraw USDC| Vault["MorphoLeverageVault"]
     Owner(["Owner"]) -->|registerMarket, setMaxLeverage, setMaxSlippageBps, setAllocator| Vault
-    Owner -->|breaker thresholds, pause, emergencyDecrease| Vault
+    Owner -->|risk-limit thresholds, pause, emergencyDecrease| Vault
     Allocator(["Off-chain allocator<br/>Node.js service, not built yet"]) -->|executeActions| Vault
-    Vault -->|checked against| Breaker["CircuitBreaker"]
+    Vault -->|checked against| Limits["RiskLimits"]
     Vault -->|flashloan bundle| Bundler3["Bundler3"]
     Bundler3 --> GeneralAdapter1
     GeneralAdapter1 --> MorphoBlue["Morpho Blue"]
@@ -165,9 +165,9 @@ The repay amount is computed in Morpho's own share unit, not derived from a sepa
 
 `action.minOut` does the same job here as everywhere else: it is the floor on the collateral-to-loanToken swap. Set it below the computed repay amount and a bad fill reverts cleanly in the swap executor, instead of failing later when the flashloan can't be covered. A target of exactly `1e18` pays off all debt using exact shares (same reasoning as a full close) but still leaves collateral behind, since only the debt side ends up at zero, not the whole position. Requesting a target at or above the position's current leverage reverts with `TargetLeverageNotBelowCurrent`; there is nothing to unwind in that direction.
 
-## Circuit breaker
+## Risk limits
 
-`CircuitBreaker` is a second contract the engine consults on every allocator action, deployed 1:1 with the vault exactly like `MorphoSwapExecutor` (`MorphoCore`'s constructor deploys it, and it records the vault as its only trusted caller). It does not decide *which* markets are usable or *how much* leverage a single increase may request — `MorphoMarketRegistry`'s whitelist and per-market `maxLeverage` already own that, checked inline by the engine before any of this ever runs. The breaker adds thresholds that don't exist anywhere else: how much exposure the vault carries in aggregate, how fast it can grow, and whether a price it's about to trust looks sane.
+`RiskLimits` is a second contract the engine consults on every allocator action, deployed 1:1 with the vault exactly like `MorphoSwapExecutor` (`MorphoCore`'s constructor deploys it, and it records the vault as its only trusted caller). It does not decide *which* markets are usable or *how much* leverage a single increase may request — `MorphoMarketRegistry`'s whitelist and per-market `maxLeverage` already own that, checked inline by the engine before any of this ever runs. RiskLimits adds thresholds that don't exist anywhere else: how much exposure the vault carries in aggregate, how fast it can grow, and whether a price it's about to trust looks sane.
 
 Checks it enforces, all owner-configurable and all fail-open (default `0` = unenforced) until set:
 
@@ -178,15 +178,15 @@ Checks it enforces, all owner-configurable and all fail-open (default `0` = unen
 - **Rate limiting on exposure growth.** A fixed-window counter per market caps how much *net* exposure growth (in `ASSET` terms) a market can absorb per window. Increases consume budget and decreases release it, saturating at zero. Netting rather than counting gross churn is deliberate: charging an unwind would mean a de-risking allocator locks itself out of re-entering the market it just made safer, worst precisely during the volatility that prompted the unwind. Known tradeoff of the fixed window: acting right at a window's end and again right after the next one starts can admit close to twice the nominal cap. A cap cannot be set while the window is still zero, since a zero window silently turns a per-window budget into a per-action one.
 - **A global pause**, blocking new increases everywhere while leaving decreases untouched.
 
-None of this ever inspects `MarketAction.swapCalldata`. Every check works off structured values the engine already computed (leverage, total exposure, the oracle price it already fetched) or live on-chain state — the swap route itself stays opaque to the breaker exactly as it already is to the rest of the system, checked only by its realized output against an oracle floor in `MorphoSwapExecutor`.
+None of this ever inspects `MarketAction.swapCalldata`. Every check works off structured values the engine already computed (leverage, total exposure, the oracle price it already fetched) or live on-chain state — the swap route itself stays opaque to RiskLimits exactly as it already is to the rest of the system, checked only by its realized output against an oracle floor in `MorphoSwapExecutor`.
 
-**Admin rights.** The breaker has no owner of its own: it reads `owner()` off the vault, so an ownership transfer there carries over with no second step. It deliberately does not accept the vault contract itself as an admin: that would authorize every present and future vault code path to reach every setter, and buys nothing, since the owner can call the breaker directly.
+**Admin rights.** RiskLimits has no owner of its own: it reads `owner()` off the vault, so an ownership transfer there carries over with no second step. It deliberately does not accept the vault contract itself as an admin: that would authorize every present and future vault code path to reach every setter, and buys nothing, since the owner can call RiskLimits directly.
 
-**Emergency exit.** `MorphoLeverageVault.emergencyDecrease` lets the owner force a decrease on any position directly, bypassing the allocator role *and* the circuit breaker entirely — not paused, not rate-limited, not gated by anything the breaker enforces. This is deliberate: an emergency exit that could itself be blocked by an over-tight or malfunctioning breaker would defeat the point of having one.
+**Emergency exit.** `MorphoLeverageVault.emergencyDecrease` lets the owner force a decrease on any position directly, bypassing the allocator role *and* the risk-limit gate entirely — not paused, not rate-limited, not gated by anything RiskLimits enforces. This is deliberate: an emergency exit that could itself be blocked by an over-tight or malfunctioning risk-limit gate would defeat the point of having one.
 
 **Simulating before broadcasting.** `previewBeforeIncrease` mirrors `checkBeforeIncrease`'s pre-checks (price deviation, rate limit) as a genuine `view` call, sharing the exact same evaluation logic rather than a second copy — an off-chain allocator can call it for free before ever fetching a swap quote, instead of discovering a revert by broadcasting.
 
-An earlier version of this contract also carried its own market allowlist and leverage ceiling, deliberately separate from the registry's, on a defense-in-depth theory: two independent authorities, both must agree. In practice the breaker's admin is the same vault owner that already administers the registry, so "two independent authorities" was really one key setting the same fact in two places — real operational cost (every `registerMarket` call needing a second, easy-to-forget setup step on a different contract) for no actual independence. It was removed for that reason: one door to configure a market, not two that have to agree.
+An earlier version of this contract also carried its own market allowlist and leverage ceiling, deliberately separate from the registry's, on a defense-in-depth theory: two independent authorities, both must agree. In practice the RiskLimits admin is the same vault owner that already administers the registry, so "two independent authorities" was really one key setting the same fact in two places — real operational cost (every `registerMarket` call needing a second, easy-to-forget setup step on a different contract) for no actual independence. It was removed for that reason: one door to configure a market, not two that have to agree.
 
 ## Safety model
 
@@ -205,7 +205,7 @@ The allocator is a hot key that picks both the swap venue and the calldata sent 
 Known gaps, not yet addressed:
 
 - Nothing on-chain enforces an idle buffer, so depositors can only withdraw whatever the allocator happens to have left uninvested. Keeping enough idle to honor redemptions is the off-chain engine's job.
-- A liquidation is visible in valuation after the fact. The circuit breaker's minimum health factor (see [Circuit breaker](#circuit-breaker)) blocks an *increase* from landing a position below a configured floor, but nothing on-chain protects an already-open position from later drifting into liquidation range as prices move — monitoring position health over time is still the off-chain engine's job.
+- A liquidation is visible in valuation after the fact. RiskLimits' minimum health factor (see [Risk limits](#risk-limits)) blocks an *increase* from landing a position below a configured floor, but nothing on-chain protects an already-open position from later drifting into liquidation range as prices move — monitoring position health over time is still the off-chain engine's job.
 
 ## Repository layout
 
@@ -222,7 +222,7 @@ src/morpho/
     MorphoPositionValuation.sol   live position valuation
     MorphoSharesMath.sol          Morpho Blue's shares/assets math
     MorphoSwapExecutor.sol        slippage-checked swap execution
-    CircuitBreaker.sol            risk-limit gate and emergency pause
+    RiskLimits.sol            risk-limit gate and emergency pause
     MorphoLeverageEngine.sol      flashloan bundle construction and execution
 
 test/
@@ -237,7 +237,7 @@ script/
   Config.sol                     shared loader for the chain config JSON
   Deploy.s.sol                   deploy, register markets, set limits, seed
   RegisterMarket.s.sol           add a market to a live vault
-  ConfigureBreaker.s.sol         reapply breaker thresholds, or emit multisig calldata
+  ConfigureRiskLimits.s.sol         reapply risk-limit thresholds, or emit multisig calldata
   LocalLoop.s.sol                fork-only increase/close cycle against a mock venue
   config/<chainid>.json          addresses, market params, and risk policy
 
@@ -278,7 +278,7 @@ Copy `.env.example` to `.env` and fill in `ARBITRUM_RPC_URL` before running fork
 
 ## Deployment
 
-Addresses and risk policy live in `script/config/<chainid>.json`, not in Solidity, so adding a chain is a new file rather than a new branch and changing a threshold is not a code change. `script/Deploy.s.sol` reads it, deploys the vault, registers every market, applies the breaker thresholds, seeds the vault, and writes `deployments/<chainid>.json`. That artifact is the handoff to the off-chain allocator, which reads its addresses from there rather than carrying a copy.
+Addresses and risk policy live in `script/config/<chainid>.json`, not in Solidity, so adding a chain is a new file rather than a new branch and changing a threshold is not a code change. `script/Deploy.s.sol` reads it, deploys the vault, registers every market, applies the risk-limit thresholds, seeds the vault, and writes `deployments/<chainid>.json`. That artifact is the handoff to the off-chain allocator, which reads its addresses from there rather than carrying a copy.
 
 ```shell
 forge script script/Deploy.s.sol --rpc-url $ARBITRUM_RPC_URL --broadcast --verify
@@ -286,7 +286,7 @@ forge script script/Deploy.s.sol --rpc-url $ARBITRUM_RPC_URL --broadcast --verif
 
 Three ordering constraints are baked into the script, all of them things that fail confusingly if done in the wrong order:
 
-**Ownership is configured before it is handed over.** `CircuitBreaker` resolves its admin as the vault's current `owner()`, and `Ownable` sets that in the constructor, so deploying straight to a multisig would lock the script out of `registerMarket`, `setAllocator`, and every breaker setter. The vault is always deployed owned by the deployer, configured, and only then transferred. The transfer cannot complete from a script either: `Ownable2Step` needs the incoming owner to call `acceptOwnership()`. Set `VAULT_OWNER` to initiate it, and the script says loudly that it is pending.
+**Ownership is configured before it is handed over.** `RiskLimits` resolves its admin as the vault's current `owner()`, and `Ownable` sets that in the constructor, so deploying straight to a multisig would lock the script out of `registerMarket`, `setAllocator`, and every RiskLimits setter. The vault is always deployed owned by the deployer, configured, and only then transferred. The transfer cannot complete from a script either: `Ownable2Step` needs the incoming owner to call `acceptOwnership()`. Set `VAULT_OWNER` to initiate it, and the script says loudly that it is pending.
 
 **The rate-limit window precedes every per-market cap.** `setMaxExposureChangePerWindow` reverts `RateLimitWindowNotSet` while the window is zero.
 
@@ -296,10 +296,10 @@ Post-deploy admin lives in two scripts, kept separate from `Deploy` because once
 
 ```shell
 MARKET_INDEX=1 forge script script/RegisterMarket.s.sol --rpc-url $RPC --broadcast
-forge script script/ConfigureBreaker.s.sol --sig "printCalldata()" --rpc-url $RPC
+forge script script/ConfigureRiskLimits.s.sol --sig "printCalldata()" --rpc-url $RPC
 ```
 
-`printCalldata` emits the encoded breaker calls in dependency order for a multisig to execute.
+`printCalldata` emits the encoded RiskLimits calls in dependency order for a multisig to execute.
 
 ### Local fork runbook
 
@@ -328,7 +328,7 @@ A clean round trip at 2x on 100,000 USDC of own capital returns the vault to zer
 ## Status and roadmap
 
 Done:
-- Vault, leverage engine, registry, valuation, swap executor, circuit breaker, and their tests.
+- Vault, leverage engine, registry, valuation, swap executor, risk-limit gate, and their tests.
 - Verified against real Arbitrum mainnet Morpho Blue, Bundler3, and GeneralAdapter1 deployments.
 
 Not built yet:

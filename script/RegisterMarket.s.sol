@@ -5,11 +5,11 @@ import {console2} from "forge-std/console2.sol";
 
 import {Id} from "../src/morpho/interfaces/IMorpho.sol";
 import {MorphoLeverageVault} from "../src/morpho/MorphoLeverageVault.sol";
-import {CircuitBreaker} from "../src/morpho/libraries/CircuitBreaker.sol";
+import {RiskLimits} from "../src/morpho/libraries/RiskLimits.sol";
 import {ChainConfig, MarketEntry, ConfigLoader} from "./Config.sol";
 
 /// @notice Registers one additional market on an already-deployed vault, and applies that
-///         market's breaker thresholds in the same transaction batch.
+///         market's risk-limit thresholds in the same transaction batch.
 ///
 /// @dev Separate from Deploy because markets get added over the vault's life, and the
 ///      registration path should not only exist inside a one-shot deploy script. Reads the
@@ -18,8 +18,8 @@ import {ChainConfig, MarketEntry, ConfigLoader} from "./Config.sol";
 ///
 ///      Broadcasts with a single OWNER_PRIVATE_KEY, so it stops working the moment the
 ///      vault's owner moves to a multisig — there's no key left to sign with. Unlike
-///      ConfigureBreaker, there's no printCalldata() mode here yet; registering a market
-///      after handover means building the registerMarket and breaker calls by hand.
+///      ConfigureRiskLimits, there's no printCalldata() mode here yet; registering a market
+///      after handover means building the registerMarket and limits calls by hand.
 ///
 /// Usage:
 ///   MARKET_INDEX=1 forge script script/RegisterMarket.s.sol --rpc-url $ARBITRUM_RPC_URL --broadcast
@@ -34,7 +34,7 @@ contract RegisterMarket is ConfigLoader {
 
         address vaultAddr = vm.parseJsonAddress(vm.readFile(_deploymentPath()), ".vault");
         MorphoLeverageVault vault = MorphoLeverageVault(vaultAddr);
-        CircuitBreaker breaker = CircuitBreaker(vault.circuitBreaker());
+        RiskLimits limits = RiskLimits(vault.riskLimits());
 
         _requireLiveOnMorpho(c.morpho, m, c.asset);
         require(!vault.isMarketEnabled(_marketId(m.params)), "market already registered on this vault");
@@ -43,17 +43,17 @@ contract RegisterMarket is ConfigLoader {
         // deployed by Deploy.s.sol it already is set, but this script can also run against a
         // vault configured by hand, so check rather than assume.
         require(
-            m.maxExposureChangePerWindow == 0 || breaker.rateLimitWindowSeconds() != 0,
-            "set breaker rateLimitWindowSeconds before registering a market with a rate limit"
+            m.maxExposureChangePerWindow == 0 || limits.rateLimitWindowSeconds() != 0,
+            "set limits rateLimitWindowSeconds before registering a market with a rate limit"
         );
 
         vm.startBroadcast(vm.envUint("OWNER_PRIVATE_KEY"));
 
         Id id = vault.registerMarket(m.params, m.maxLeverage, m.maxSlippageBps);
-        breaker.setMinHealthFactor(id, m.minHealthFactor);
-        breaker.setMaxPriceDeviationBps(id, m.maxPriceDeviationBps);
-        breaker.setMaxExposureChangePerWindow(id, m.maxExposureChangePerWindow);
-        breaker.setMaxAssetExposure(m.params.collateralToken, m.assetExposureCap);
+        limits.setMinHealthFactor(id, m.minHealthFactor);
+        limits.setMaxPriceDeviationBps(id, m.maxPriceDeviationBps);
+        limits.setMaxExposureChangePerWindow(id, m.maxExposureChangePerWindow);
+        limits.setMaxAssetExposure(m.params.collateralToken, m.assetExposureCap);
 
         vm.stopBroadcast();
 

@@ -5,7 +5,7 @@ import {Script} from "forge-std/Script.sol";
 import {IMorpho, Id, MarketParams} from "../src/morpho/interfaces/IMorpho.sol";
 
 /// @notice One market entry from the chain config: the Morpho market itself, the registry
-///         limits it is registered with, and the breaker thresholds scoped to it.
+///         limits it is registered with, and the risk-limit thresholds scoped to it.
 struct MarketEntry {
     string name;
     MarketParams params;
@@ -17,8 +17,8 @@ struct MarketEntry {
     uint256 assetExposureCap;
 }
 
-/// @notice Breaker thresholds that are not scoped to a single market.
-struct GlobalBreakerConfig {
+/// @notice Thresholds that are not scoped to a single market.
+struct GlobalRiskLimitsConfig {
     bool paused;
     uint256 priceObservationMaxAge;
     uint256 rateLimitWindowSeconds;
@@ -35,7 +35,7 @@ struct ChainConfig {
     uint256 seedAmount;
     address seedBurnAddress;
     uint256 actionDropToleranceBps;
-    GlobalBreakerConfig breaker;
+    GlobalRiskLimitsConfig riskLimits;
 }
 
 /// @notice Shared loader for script/config/<chainid>.json.
@@ -74,12 +74,12 @@ abstract contract ConfigLoader is Script {
         c.seedBurnAddress = vm.parseJsonAddress(json, ".seed.burnAddress");
         c.actionDropToleranceBps = vm.parseJsonUint(json, ".vault.actionDropToleranceBps");
 
-        c.breaker = GlobalBreakerConfig({
-            paused: vm.parseJsonBool(json, ".breaker.paused"),
-            priceObservationMaxAge: vm.parseJsonUint(json, ".breaker.priceObservationMaxAge"),
-            rateLimitWindowSeconds: vm.parseJsonUint(json, ".breaker.rateLimitWindowSeconds"),
-            maxAggregateDebt: vm.parseJsonUint(json, ".breaker.maxAggregateDebt"),
-            maxSlippageBpsCeiling: vm.parseJsonUint(json, ".breaker.maxSlippageBpsCeiling")
+        c.riskLimits = GlobalRiskLimitsConfig({
+            paused: vm.parseJsonBool(json, ".riskLimits.paused"),
+            priceObservationMaxAge: vm.parseJsonUint(json, ".riskLimits.priceObservationMaxAge"),
+            rateLimitWindowSeconds: vm.parseJsonUint(json, ".riskLimits.rateLimitWindowSeconds"),
+            maxAggregateDebt: vm.parseJsonUint(json, ".riskLimits.maxAggregateDebt"),
+            maxSlippageBpsCeiling: vm.parseJsonUint(json, ".riskLimits.maxSlippageBpsCeiling")
         });
     }
 
