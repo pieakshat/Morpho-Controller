@@ -18,7 +18,7 @@ jobs:
       # in the job log.
       security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           submodules: recursive
