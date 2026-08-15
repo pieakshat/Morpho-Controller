@@ -33,6 +33,15 @@ export {
 } from "./state.js";
 
 export {
+  assertPlanFresh,
+  encode,
+  encodeExecuteActions,
+  type EncodeOptions,
+} from "./encode.js";
+
+export type { Quote, QuoteProvider, QuoteRequest } from "./quote.js";
+
+export {
   checkBeforeIncrease,
   isIncreasePlan,
   oracleFloor,
