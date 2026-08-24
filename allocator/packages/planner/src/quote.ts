@@ -16,9 +16,17 @@ export interface QuoteRequest {
   amountIn: bigint;
 
   /**
-   * Who receives the output. Must be the plan's `swap.recipient`, which is GeneralAdapter1
-   * for anything involving a flashloan, not the vault. Aggregators that cannot target an
-   * arbitrary receiver are unusable here.
+   * Who the ROUTER pays: the vault's swap executor, the same address as `caller`.
+   *
+   * Not `plan.swap.recipient`. That field records where `executeSwap` forwards the output
+   * afterwards, which is GeneralAdapter1 whenever a flashloan is open. The two are different
+   * addresses and pointing the route at the second one is silently fatal: `executeSwap`
+   * enforces `minOut` against its OWN balance delta, so a route that pays GeneralAdapter1
+   * directly leaves that delta at zero and the bundle reverts `SlippageExceeded(0, minOut)`
+   * with the output already delivered somewhere the check cannot see it.
+   *
+   * Aggregators that cannot target an arbitrary receiver are still unusable here, since the
+   * executor is not the transaction sender.
    */
   recipient: Address;
 

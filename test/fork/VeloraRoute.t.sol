@@ -77,9 +77,18 @@ contract VeloraRouteForkTest is Test {
 
         uint256 delivered = IERC20(WSTETH).balanceOf(receiver) - receiverBefore;
 
-        // Delivered to the receiver we asked for, not to the caller. This is the property the
-        // decrease path depends on: with a flashloan open, proceeds must land on
-        // GeneralAdapter1, because Morpho reclaims inside the same call.
+        // Delivered to the receiver named in the quote, not to the caller: the property under
+        // test is that Velora honours an arbitrary receiver at all, since the executor is
+        // never the transaction sender.
+        //
+        // NOTE the receiver this fixture names is GeneralAdapter1, which is NOT what a
+        // production route should ask for. MorphoSwapExecutor enforces minOut against its OWN
+        // balance delta and only then forwards to GeneralAdapter1, so a route paying
+        // GeneralAdapter1 directly leaves that delta at zero and the bundle dies on
+        // SlippageExceeded(0, minOut) with the tokens already delivered somewhere the check
+        // cannot see them. The allocator therefore quotes with the executor as receiver; see
+        // the recipient note in allocator/packages/planner/src/quote.ts. Regenerating this
+        // fixture is the moment to align it.
         assertGt(delivered, 0, "receiver got nothing");
         assertEq(
             IERC20(WSTETH).balanceOf(caller),
