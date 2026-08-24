@@ -23,6 +23,7 @@
       "irm": "0x66F30587FB8D4206918deb78ecA7d5eBbafD06DA",
       "lltv": "860000000000000000",
       "maxLeverage": "5000000000000000000",
+      "_maxSlippageBpsComment": "Measured against Velora on Arbitrum at a matched block: an honest 100k USDC -> wstETH route lands ~8bps below this oracle, and price impact adds roughly 14bps more by 500k, so ~22bps at the top of the realistic size range. 50 leaves comfortable headroom. Verified continuously by test/fork/VeloraRoute.t.sol, which fails if the real spread ever grows past this number. Measure at a MATCHED block: comparing a quote against an oracle price read at a different block measures price drift between the two, not spread.",
       "maxSlippageBps": 50,
       "minHealthFactor": "1150000000000000000",
       "maxPriceDeviationBps": 500,

@@ -24,9 +24,23 @@ export interface QuoteRequest {
 
   /**
    * The address that will hold the tokens and call the venue: the vault's swap executor.
-   * Aggregators price and sometimes encode against the caller, so this is not cosmetic.
+   * This is `msg.sender` at the router, and aggregators encode against it.
    */
   caller: Address;
+
+  /**
+   * The EOA that will actually send the transaction, i.e. the allocator key.
+   *
+   * Distinct from `caller` here, and aggregators care. Velora requires `txOrigin` whenever
+   * `msg.sender` differs from the transaction sender, which is always true for this system:
+   * the allocator sends to the vault, and the swap executor is what reaches the router four
+   * hops later.
+   */
+  txOrigin: Address;
+
+  /** Required because tokens are identified by address rather than symbol. */
+  srcDecimals: number;
+  destDecimals: number;
 }
 
 export interface Quote {

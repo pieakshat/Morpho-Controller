@@ -40,6 +40,7 @@ export {
 } from "./encode.js";
 
 export type { Quote, QuoteProvider, QuoteRequest } from "./quote.js";
+export { createVeloraQuoteProvider, VeloraError, type VeloraOptions } from "./velora.js";
 
 export {
   checkBeforeIncrease,
