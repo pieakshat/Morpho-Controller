@@ -10,7 +10,7 @@ import type { IncreasePlan } from "./types.js";
 /**
  * Mirrors `MorphoLeverageEngine._increasePosition`, in its order.
  *
- * The one figure that is not obvious: the swap goes loanToken -> collateralToken, so the
+ * the swap goes loanToken -> collateralToken, so the
  * oracle's collateral-per-loan-token rate is the INVERSE of the price it quotes. Decreases go
  * the other way and apply it directly. Getting this backwards produces a floor off by the
  * square of the price, which fails loudly rather than subtly, but only at execution.

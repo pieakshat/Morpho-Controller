@@ -33,6 +33,14 @@ export {
 } from "./state.js";
 
 export {
+  planBatch,
+  projectEncodedBatch,
+  type BatchOptions,
+  type BatchPlan,
+  type BatchProjection,
+} from "./batch.js";
+
+export {
   assertPlanFresh,
   encode,
   encodeExecuteActions,

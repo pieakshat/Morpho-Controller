@@ -22,6 +22,7 @@ export type PlannerFailure =
   | { code: "MarketNotInSnapshot"; marketId: Id }
   | { code: "OracleUnavailable"; marketId: Id }
   | { code: "InsufficientIdle"; required: bigint; available: bigint }
+  | { code: "DuplicateMarketInBatch"; marketId: Id }
 
   // --- mirrors of MorphoLeverageEngine / MorphoMarketRegistry ---
   | { code: "MarketNotEnabled"; marketId: Id }
@@ -69,6 +70,8 @@ export function describeFailure(f: PlannerFailure): string {
       return `${f.code}: ${f.marketId}'s oracle is not answering, so no swap floor can be derived`;
     case "InsufficientIdle":
       return `${f.code}: needs ${f.required} idle, vault holds ${f.available}`;
+    case "DuplicateMarketInBatch":
+      return `${f.code}: ${f.marketId} appears twice; the planner cannot model a position changing mid-batch`;
     case "MarketNotEnabled":
       return `${f.code}: ${f.marketId} is registered but disabled, so increases are blocked`;
     case "LeverageBelowOneX":
