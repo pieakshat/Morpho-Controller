@@ -11,7 +11,7 @@
 
 import { type Account, type Address, type Hex, type PublicClient, type TransactionReceipt, type WalletClient } from "viem";
 
-import { extractRevertData } from "./simulate.js";
+import { extractRevertData, isTransportFailure } from "./simulate.js";
 import { decodeVaultError, describeRevert } from "@morphoagg/planner";
 
 export interface SubmitOptions {
@@ -58,6 +58,24 @@ export class StuckTransactionError extends Error {
   }
 }
 
+/**
+ * The gas estimate reverted, having simulated cleanly moments earlier.
+ *
+ * Always a race rather than a bad batch: the two calls run against different blocks, and
+ * anything that moves a pool, a price, or the debt in between lands here. Nothing is signed,
+ * so the only cost is the round trip.
+ */
+export class GasEstimationRevertedError extends Error {
+  constructor(readonly reason: string) {
+    super(
+      `gas estimation reverted: ${reason}.\n` +
+        `Simulation passed just before this, so state moved in between. Nothing was signed; ` +
+        `re-read, re-plan and re-quote.`,
+    );
+    this.name = "GasEstimationRevertedError";
+  }
+}
+
 export class ExecutionRevertedError extends Error {
   constructor(
     readonly hash: Hex,
@@ -82,11 +100,16 @@ export async function submitExecuteActions(
   const confirmTimeoutMs = options.confirmTimeoutMs ?? DEFAULTS.confirmTimeoutMs;
   const confirmations = options.confirmations ?? DEFAULTS.confirmations;
 
-  const estimate = await publicClient.estimateGas({
-    account,
-    to: args.vault,
-    data: args.data,
-  });
+  // Wrapped, because a revert here escapes as a viem error carrying the entire transaction
+  // including several kilobytes of swap calldata, which buries the one byte that matters. It
+  // also means something moved between the simulation and now, which is worth saying plainly.
+  let estimate: bigint;
+  try {
+    estimate = await publicClient.estimateGas({ account, to: args.vault, data: args.data });
+  } catch (error) {
+    if (isTransportFailure(error)) throw error;
+    throw new GasEstimationRevertedError(describeRevert(decodeVaultError(extractRevertData(error))));
+  }
   const gas = (estimate * (10_000n + gasBufferBps)) / 10_000n;
 
   // Read the nonce explicitly rather than letting viem fill it. It has to appear in the stuck

@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_MULTICALL3, deploymentPath, envSchema, loadConfig, maxPlanAge } from "../src/config.js";
+import { DEFAULT_MULTICALL3, deploymentPath, envSchema, loadConfig } from "../src/config.js";
 import { ADDRESSES, MARKET_A } from "./world.js";
 
 function writeDeployment(chainId: number, name: string): string {
@@ -79,13 +79,24 @@ describe("deployment records", () => {
 });
 
 describe("freshness policy", () => {
-  it("holds a drifting plan to a much tighter budget than a stable one", () => {
+  it("denominates the budget in seconds, with blocks only as a backstop", () => {
     const dir = writeDeployment(42161, "42161.json");
     const { policy } = loadConfig({ ...BASE_ENV, DEPLOYMENTS_DIR: dir }, dir);
 
-    // A deleverage's swap amount derives from debt that grows every block, so one block is
-    // the honest budget. Widening it would not make the plan more correct.
-    expect(maxPlanAge(policy, "drifts")).toBe(1n);
-    expect(maxPlanAge(policy, "stable")).toBeGreaterThan(maxPlanAge(policy, "drifts"));
+    // Seconds, because what age costs is a price move and the oracle floor it has to clear is
+    // recomputed live at execution. Blocks would mean something different on every chain.
+    expect(policy.maxPlanAgeSeconds).toBe(45);
+
+    // Loose enough that it never fires ahead of the seconds budget on a healthy chain: 600
+    // Arbitrum blocks is about 150 seconds.
+    expect(policy.maxPlanAgeBlocks).toBe(600n);
+  });
+
+  it("leaves room for the round trip a real quote costs", () => {
+    const dir = writeDeployment(42161, "42161.json");
+    const { policy } = loadConfig({ ...BASE_ENV, DEPLOYMENTS_DIR: dir }, dir);
+    // Quote plus encode plus simulate runs 1 to 3 seconds. The budget it replaced was one
+    // Arbitrum block, a quarter of a second, which no deleverage could ever have met.
+    expect(policy.maxPlanAgeSeconds).toBeGreaterThan(10);
   });
 });

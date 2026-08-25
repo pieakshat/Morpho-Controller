@@ -14,8 +14,9 @@ import { ADDRESSES, MARKET_A, MARKET_B, makeWorld } from "./world.js";
 const FAKE_ROUTER = getAddress("0x000000000000000000000000000000000000a000");
 
 const POLICY: Policy = {
-  maxPlanAgeBlocksStable: 30n,
-  maxPlanAgeBlocksDrifts: 1n,
+  simulateBlockTag: "pending",
+  maxPlanAgeSeconds: 45,
+  maxPlanAgeBlocks: 600n,
   quoteSlippageBps: 50n,
   accrualBufferBps: 25n,
 };
@@ -57,8 +58,8 @@ function fakeQuotes(shortfallBps: bigint, world: FakeWorld): QuoteProvider {
 interface StubOptions {
   /** Revert data for the `executeActions` simulation. Undefined means it passes. */
   simulationRevert?: Hex;
-  /** Head block reported by `getBlockNumber`, to age plans past their budget. */
-  head?: bigint;
+  /** Seconds to advance the head past the snapshot, to age plans past their budget. */
+  ageSeconds?: bigint;
 }
 
 function stubClients(world: FakeWorld, options: StubOptions = {}): Clients {
@@ -81,8 +82,9 @@ function stubClients(world: FakeWorld, options: StubOptions = {}): Clients {
       }
       throw new Error(`stub has no contract at ${to}`);
     },
-    async getBlockNumber() {
-      return options.head ?? world.blockNumber;
+    async getBlock() {
+      const age = options.ageSeconds ?? 0n;
+      return { number: world.blockNumber + age, timestamp: world.timestamp + age };
     },
   };
 
@@ -109,6 +111,40 @@ const INCREASE = {
   ownAmount: 100_000_000_000n,
   leverage: 2n * 10n ** 18n,
 };
+
+const DELEVERAGE = {
+  kind: "deleverageTo" as const,
+  marketId: MARKET_A,
+  targetLeverage: 1_500_000_000_000_000_000n,
+};
+
+describe("deleverage", () => {
+  /**
+   * This documents a CONTRACT bug, not a planner one, and the refusal here is correct.
+   *
+   * `_planDeleverage` sets `collateralToWithdraw = mulDivUp(flashloanAmount, 1e36, price)`, so
+   * the collateral being sold is worth exactly what the flashloan reclaims AT THE ORACLE. Every
+   * real route fills below the oracle, so the swap output is always short by the spread.
+   *
+   * There is nothing to make up the difference. `morphoFlashLoan` is taken by GeneralAdapter1
+   * and Morpho reclaims from GeneralAdapter1 synchronously inside the callback, while the only
+   * sweep of the vault's own balance runs AFTER the flashloan returns. The vault's idle is
+   * therefore unreachable at the moment it would be needed.
+   *
+   * Confirmed on an Arbitrum fork: seeding GeneralAdapter1 with 1,000 USDC made an otherwise
+   * identical deleverage simulate cleanly, and without it the bundle died on Morpho's own
+   * "transferFrom reverted". Until the engine grosses the withdrawal up, refusing locally is
+   * strictly better than paying gas to learn the same thing.
+   */
+  it("refuses a deleverage the contract cannot execute", async () => {
+    const result = await runOnce(deps(makeWorld()), [DELEVERAGE]);
+
+    expect(result.outcome).toBe("rejected");
+    if (result.outcome !== "rejected") return;
+    expect(result.stage).toBe("encode");
+    expect(result.reason).toMatch(/QuoteCannotCoverFlashloan/);
+  });
+});
 
 describe("runOnce", () => {
   it("plans, quotes, encodes and simulates a 2x increase without submitting", async () => {
@@ -174,14 +210,20 @@ describe("runOnce", () => {
     expect(result.reason).toMatch(/QuoteBelowOracleFloor/);
   });
 
-  it("names the freshness stage when the head has moved past the budget", async () => {
+  it("names the freshness stage when the clock has moved past the budget", async () => {
     const world = makeWorld();
-    const result = await runOnce(deps(world, { head: world.blockNumber + 500n }), [INCREASE]);
+    const result = await runOnce(deps(world, { ageSeconds: 500n }), [INCREASE]);
 
     expect(result.outcome).toBe("rejected");
     if (result.outcome !== "rejected") return;
     expect(result.stage).toBe("freshness");
-    expect(result.reason).toMatch(/500 blocks old/);
+    expect(result.reason).toMatch(/500 seconds old/);
+  });
+
+  it("does not reject a plan merely for taking a few seconds to quote", async () => {
+    const world = makeWorld();
+    const result = await runOnce(deps(world, { ageSeconds: 3n }), [INCREASE]);
+    expect(result.outcome).toBe("simulated");
   });
 
   it("decodes a simulation revert to a named error rather than raw bytes", async () => {

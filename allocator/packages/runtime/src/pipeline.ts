@@ -82,12 +82,14 @@ export async function runOnce(
     return { outcome: "rejected", state, stage: stageOf(error), reason: messageOf(error) };
   }
 
-  // Freshness is measured against the CURRENT head, not the block the state was read at.
-  // Quoting sat between the two, and on a chain with sub-second blocks an aggregator round
-  // trip is already several blocks of accrual.
-  const head = await clients.publicClient.getBlockNumber();
+  // Freshness is measured against the CURRENT head, not the block the state was read at:
+  // quoting sat between the two. `getBlock` rather than `getBlockNumber` because the budget is
+  // denominated in seconds, and the head's timestamp is the other half of that measurement.
+  const headBlock = await clients.publicClient.getBlock({ blockTag: "latest" });
+  const head = { blockNumber: headBlock.number, timestamp: headBlock.timestamp };
+  const snapshot = { blockNumber: state.blockNumber, timestamp: state.timestamp };
   try {
-    assertBatchFresh(prepared.plans, head, config.policy);
+    assertBatchFresh(prepared.plans, snapshot, head, config.policy);
   } catch (error) {
     return { outcome: "rejected", state, stage: "freshness", reason: messageOf(error) };
   }

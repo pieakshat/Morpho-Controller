@@ -9,11 +9,18 @@ import type { Policy } from "../src/config.js";
 import { MARKET_A } from "./world.js";
 
 const POLICY: Policy = {
-  maxPlanAgeBlocksStable: 30n,
-  maxPlanAgeBlocksDrifts: 1n,
+  simulateBlockTag: "pending",
+  maxPlanAgeSeconds: 45,
+  maxPlanAgeBlocks: 600n,
   quoteSlippageBps: 50n,
   accrualBufferBps: 25n,
 };
+
+const SNAPSHOT = { blockNumber: 1_000n, timestamp: 1_800_000_000n };
+const at = (secondsLater: bigint, blocksLater = 1n) => ({
+  blockNumber: SNAPSHOT.blockNumber + blocksLater,
+  timestamp: SNAPSHOT.timestamp + secondsLater,
+});
 
 function planAt(stateBlock: bigint, driftClass: "stable" | "drifts"): Plan {
   return {
@@ -39,25 +46,54 @@ function planAt(stateBlock: bigint, driftClass: "stable" | "drifts"): Plan {
 }
 
 describe("freshness gate", () => {
-  it("lets a stable plan age but not a drifting one", () => {
-    const head = 1_000n;
+  const stable = planAt(SNAPSHOT.blockNumber, "stable");
+  const drifts = planAt(SNAPSHOT.blockNumber, "drifts");
 
-    expect(() => assertBatchFresh([planAt(head - 5n, "stable")], head, POLICY)).not.toThrow();
-    // Same age, different class, opposite verdict. That asymmetry is the whole point of
-    // classifying drift rather than using one budget.
-    expect(() => assertBatchFresh([planAt(head - 5n, "drifts")], head, POLICY)).toThrow(StalePlanError);
+  it("measures age in seconds, not blocks", () => {
+    // 400 blocks is a quarter of the block backstop, but on a sub-second chain it is only a
+    // hundred seconds of wall clock. Seconds is what decides.
+    expect(() => assertBatchFresh([stable], SNAPSHOT, at(10n, 400n), POLICY)).not.toThrow();
+    expect(() => assertBatchFresh([stable], SNAPSHOT, at(46n, 2n), POLICY)).toThrow(StalePlanError);
   });
 
-  it("accepts a plan exactly at its budget and refuses one block past it", () => {
-    const head = 1_000n;
-    expect(() => assertBatchFresh([planAt(head - 1n, "drifts")], head, POLICY)).not.toThrow();
-    expect(() => assertBatchFresh([planAt(head - 2n, "drifts")], head, POLICY)).toThrow(StalePlanError);
+  /**
+   * The correction this whole change is about. The earlier version held a deleverage to one
+   * block on the theory that accrual made it stale immediately. Measured, a 100k position
+   * accrues 0.000033 USDC per Arbitrum block against a 250 USDC buffer, so the gate was
+   * refusing at a quarter of a second to protect three weeks of headroom, and every deleverage
+   * died before it reached simulation.
+   */
+  it("holds a drifting plan to exactly the same clock as a stable one", () => {
+    const justInside = at(45n);
+    const justOutside = at(46n);
+
+    for (const plan of [stable, drifts]) {
+      expect(() => assertBatchFresh([plan], SNAPSHOT, justInside, POLICY)).not.toThrow();
+      expect(() => assertBatchFresh([plan], SNAPSHOT, justOutside, POLICY)).toThrow(StalePlanError);
+    }
+  });
+
+  it("survives the round trip a real quote actually costs", () => {
+    // A Velora call plus encode plus simulate runs 1 to 3 seconds. Under the old one-block
+    // budget that was already several budgets' worth.
+    expect(() => assertBatchFresh([drifts], SNAPSHOT, at(3n, 12n), POLICY)).not.toThrow();
+  });
+
+  it("keeps blocks as a backstop for a frozen or wrong clock", () => {
+    // A node reporting a stuck timestamp would otherwise make every plan look brand new.
+    const frozenClock = { blockNumber: SNAPSHOT.blockNumber + 601n, timestamp: SNAPSHOT.timestamp };
+    expect(() => assertBatchFresh([stable], SNAPSHOT, frozenClock, POLICY)).toThrow(/601 blocks old/);
+  });
+
+  it("refuses to judge a plan built against a different snapshot", () => {
+    const foreign = planAt(SNAPSHOT.blockNumber - 5n, "stable");
+    expect(() => assertBatchFresh([foreign], SNAPSHOT, at(1n), POLICY)).toThrow(
+      /plans from different snapshots cannot be submitted together/,
+    );
   });
 
   it("fails the whole batch when any single leg is stale", () => {
-    const head = 1_000n;
-    const batch = [planAt(head, "stable"), planAt(head - 900n, "stable")];
-    expect(() => assertBatchFresh(batch, head, POLICY)).toThrow(/900 blocks old/);
+    expect(() => assertBatchFresh([stable, drifts], SNAPSHOT, at(500n), POLICY)).toThrow(StalePlanError);
   });
 });
 

@@ -30,30 +30,61 @@ import {
   type PublicClient,
 } from "viem";
 
-import { maxPlanAge, type Policy } from "./config.js";
+import type { Policy } from "./config.js";
 
 export type SimulationResult =
   | { ok: true }
   | { ok: false; revert: DecodedRevert; description: string };
+
+/** A block and its timestamp. Both the snapshot and the head are described this way. */
+export interface BlockStamp {
+  blockNumber: bigint;
+  timestamp: bigint;
+}
 
 /**
  * Refuses a batch whose plans have aged past their budget.
  *
  * Checked here rather than only inside `encode` because the age that matters is the age at
  * SUBMISSION, and everything between quoting and here takes time: an aggregator round trip is
- * hundreds of milliseconds, and on a chain with sub-second blocks that is already several
- * blocks of accrual.
+ * hundreds of milliseconds and the simulation is another.
  *
- * The budget is per drift class. A `drifts` plan encodes a swap sized from debt that grows
- * every block, so its window is one block by default and widening it does not make the plan
- * more correct, it just moves the failure on-chain where it costs gas.
+ * Measured in SECONDS against the snapshot's own timestamp, with blocks only as a backstop.
+ * What age costs is a price move, and the oracle floor it has to clear is recomputed from the
+ * LIVE price at execution, not the one the plan was built on. A plan is stale exactly when the
+ * price has moved far enough that the route can no longer clear the floor the contract will
+ * compute for it. Blocks are the wrong unit for that: the same count means seconds on one chain
+ * and minutes on another.
+ *
+ * Note this does NOT vary by drift class. See the reasoning in `config.ts` for why the earlier
+ * per-class split was wrong.
  */
-export function assertBatchFresh(plans: readonly Plan[], currentBlock: bigint, policy: Policy): void {
+export function assertBatchFresh(
+  plans: readonly Plan[],
+  snapshot: BlockStamp,
+  head: BlockStamp,
+  policy: Policy,
+): void {
   for (const p of plans) {
-    const budget = maxPlanAge(policy, p.driftClass);
-    const age = currentBlock - p.stateBlock;
-    if (age > budget) {
-      throw new StalePlanError(p, age, budget, currentBlock);
+    // A batch is planned against one snapshot, so a plan carrying a different block did not
+    // come from this one and its timestamp is unknown. Refusing beats measuring its age
+    // against a clock that does not belong to it.
+    if (p.stateBlock !== snapshot.blockNumber) {
+      throw new Error(
+        `plan for ${p.marketId} was built at block ${p.stateBlock}, but this batch is being ` +
+          `checked against a snapshot at ${snapshot.blockNumber}; plans from different ` +
+          `snapshots cannot be submitted together`,
+      );
+    }
+
+    const ageSeconds = head.timestamp - snapshot.timestamp;
+    const ageBlocks = head.blockNumber - p.stateBlock;
+
+    if (ageSeconds > BigInt(policy.maxPlanAgeSeconds)) {
+      throw new StalePlanError(p, ageSeconds, BigInt(policy.maxPlanAgeSeconds), "seconds", head);
+    }
+    if (ageBlocks > policy.maxPlanAgeBlocks) {
+      throw new StalePlanError(p, ageBlocks, policy.maxPlanAgeBlocks, "blocks", head);
     }
   }
 }
@@ -61,14 +92,15 @@ export function assertBatchFresh(plans: readonly Plan[], currentBlock: bigint, p
 export class StalePlanError extends Error {
   constructor(
     readonly plan: Plan,
-    readonly ageBlocks: bigint,
-    readonly budgetBlocks: bigint,
-    readonly currentBlock: bigint,
+    readonly age: bigint,
+    readonly budget: bigint,
+    readonly unit: "seconds" | "blocks",
+    readonly head: BlockStamp,
   ) {
     super(
       `plan for ${plan.marketId} (${plan.kind}, driftClass=${plan.driftClass}) was built at block ` +
-        `${plan.stateBlock} and is now ${ageBlocks} blocks old at ${currentBlock}, past its budget of ` +
-        `${budgetBlocks}. Re-read state, re-plan and re-quote rather than submitting this.`,
+        `${plan.stateBlock} and is now ${age} ${unit} old at block ${head.blockNumber}, past its ` +
+        `budget of ${budget} ${unit}. Re-read state, re-plan and re-quote rather than submitting this.`,
     );
     this.name = "StalePlanError";
   }

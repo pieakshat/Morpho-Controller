@@ -16,7 +16,6 @@ export {
   envSchema,
   loadConfig,
   loadDeployment,
-  maxPlanAge,
   type Env,
   type Policy,
   type RuntimeConfig,
@@ -61,11 +60,13 @@ export {
   isTransportFailure,
   simulateExecuteActions,
   StalePlanError,
+  type BlockStamp,
   type SimulationResult,
 } from "./simulate.js";
 
 export {
   ExecutionRevertedError,
+  GasEstimationRevertedError,
   StuckTransactionError,
   submitExecuteActions,
   type SubmitOptions,

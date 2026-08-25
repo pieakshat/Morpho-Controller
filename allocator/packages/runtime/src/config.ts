@@ -87,16 +87,29 @@ export const envSchema = z.object({
   RPC_TIMEOUT_MS: positiveInt.optional(),
 
   /**
-   * How stale a plan may be at submission, by drift class.
+   * How stale a plan may be at submission, in WALL-CLOCK SECONDS.
    *
-   * Two budgets because the exposure genuinely differs. A `stable` plan's swap amount comes
-   * from the intent or from collateral, neither of which accrues, so age costs only price
-   * movement. A `drifts` plan's `amountIn` derives from accrued debt and is wrong by
-   * construction the moment a block passes, which is the failure that shows up as an opaque
-   * `SwapCallFailed`.
+   * Seconds rather than blocks because what age costs is a price move, and price moves in
+   * seconds. A block-denominated budget silently means something different on every chain:
+   * the same "30" is 7.5 seconds on Arbitrum and 6 minutes on Ethereum.
+   *
+   * What actually binds is the oracle floor, and it binds at EXECUTION, not at plan time. The
+   * engine recomputes `oracleExpectedOut` from the live price and takes `max(submitted,
+   * floor)`, so a plan is stale exactly when the price has moved far enough that the route can
+   * no longer clear the floor the contract will compute. On this market the floor allows 50
+   * bps, an honest route uses about 8 of them and price impact at size another 14, leaving
+   * roughly 28 bps of room for an adverse move. 45 seconds is comfortably inside that while
+   * leaving room for the quote, encode and simulate round trips, which run 1 to 3 seconds.
    */
-  MAX_PLAN_AGE_BLOCKS_STABLE: blockCount.optional(),
-  MAX_PLAN_AGE_BLOCKS_DRIFTS: blockCount.optional(),
+  MAX_PLAN_AGE_SECONDS: positiveInt.optional(),
+
+  /**
+   * Backstop, in blocks, against a node reporting a timestamp that is wrong or frozen.
+   *
+   * Not the binding gate. Set it loose enough that it never fires ahead of the seconds budget
+   * on a healthy chain.
+   */
+  MAX_PLAN_AGE_BLOCKS: blockCount.optional(),
 
   /**
    * Which block the pre-submit simulation runs against. `pending` by default, and that is the
@@ -126,24 +139,34 @@ export const envSchema = z.object({
 export type Env = z.infer<typeof envSchema>;
 
 /**
- * Defaults tuned for an L2 with sub-second blocks, which is where this runs first.
+ * One budget, not one per drift class, and that is a correction to an earlier version of this
+ * file worth writing down so it is not reintroduced.
  *
- * `drifts` gets one block because that is the honest number: `collateralToWithdraw` is derived
- * from debt that grows every block, so a deleverage planned two blocks ago is already encoding
- * a swap for the wrong amount. Widening this does not make the plan more correct, it just
- * moves the failure on-chain.
+ * The original split gave `drifts` a single block on the reasoning that a deleverage's swap
+ * amount derives from debt that grows every block. The reasoning was right and the magnitude
+ * was wrong by about seven orders of magnitude. Measured on the wstETH/USDC market at its real
+ * 4.14% borrow APR, a 100k position accrues 0.000033 USDC per Arbitrum block, while the 25 bps
+ * `accrualBufferBps` that `encode` already adds is 250 USDC, or twenty-two days of it. The gate
+ * was refusing at a quarter of a second to protect a buffer good for three weeks, which in
+ * practice meant every deleverage was rejected before it ever reached simulation: a Velora
+ * round trip alone is several hundred milliseconds.
+ *
+ * Accrual is not what age costs. Price movement against the live oracle floor is, and that
+ * applies identically to both classes. `driftClass` still says something true about whether the
+ * encoded swap amount will match the one the contract computes; it is simply not a reason to
+ * hold one plan to a tighter clock than another.
  */
 const POLICY_DEFAULTS = {
-  maxPlanAgeBlocksStable: 30n,
-  maxPlanAgeBlocksDrifts: 1n,
+  maxPlanAgeSeconds: 45,
+  maxPlanAgeBlocks: 600n,
   quoteSlippageBps: 50n,
   accrualBufferBps: 25n,
 } as const;
 
 export interface Policy {
   simulateBlockTag: "pending" | "latest";
-  maxPlanAgeBlocksStable: bigint;
-  maxPlanAgeBlocksDrifts: bigint;
+  maxPlanAgeSeconds: number;
+  maxPlanAgeBlocks: bigint;
   quoteSlippageBps: bigint;
   accrualBufferBps: bigint;
 }
@@ -214,8 +237,8 @@ export function loadConfig(
     deployment,
     policy: {
       simulateBlockTag: parsed.SIMULATE_BLOCK_TAG ?? "pending",
-      maxPlanAgeBlocksStable: parsed.MAX_PLAN_AGE_BLOCKS_STABLE ?? POLICY_DEFAULTS.maxPlanAgeBlocksStable,
-      maxPlanAgeBlocksDrifts: parsed.MAX_PLAN_AGE_BLOCKS_DRIFTS ?? POLICY_DEFAULTS.maxPlanAgeBlocksDrifts,
+      maxPlanAgeSeconds: parsed.MAX_PLAN_AGE_SECONDS ?? POLICY_DEFAULTS.maxPlanAgeSeconds,
+      maxPlanAgeBlocks: parsed.MAX_PLAN_AGE_BLOCKS ?? POLICY_DEFAULTS.maxPlanAgeBlocks,
       quoteSlippageBps: parsed.QUOTE_SLIPPAGE_BPS ?? POLICY_DEFAULTS.quoteSlippageBps,
       accrualBufferBps: parsed.ACCRUAL_BUFFER_BPS ?? POLICY_DEFAULTS.accrualBufferBps,
     },
@@ -232,7 +255,4 @@ function defaultDeploymentsDirectory(): string {
   return new URL("../../../../deployments", import.meta.url).pathname;
 }
 
-/** The freshness budget a plan of this drift class is held to. */
-export function maxPlanAge(policy: Policy, driftClass: "stable" | "drifts"): bigint {
-  return driftClass === "drifts" ? policy.maxPlanAgeBlocksDrifts : policy.maxPlanAgeBlocksStable;
-}
+
