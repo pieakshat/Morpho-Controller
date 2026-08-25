@@ -27,6 +27,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     ///         absorb, so no repay lands it on the requested ratio. Only reachable for a
     ///         config pairing very high leverage with a very loose slippage bound.
     error DeleverageTooCostly();
+    /// @notice The worst fill this market permits would not repay the flashloan, so the
+    ///         action cannot be executed at this floor. Raise the action's own minOut.
+    error SwapFloorCannotRepayFlashloan(uint256 minSwapOut, uint256 flashloanAmount);
     error DecreaseAmountTooSmall();
     error NoPosition(Id id);
     error PositionHasNoEquity(Id id);
@@ -264,6 +267,28 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         unwoundValue =
             MorphoSharesMath.mulDivDown(plan.collateralToWithdraw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
         plan.minSwapOut = _effectiveMinOut(unwoundValue, _marketConfigs[id].maxSlippageBps, action.minOut);
+
+        // The invariant every decrease mode has to satisfy, stated once instead of trusted
+        // three times over.
+        //
+        // Morpho reclaims `flashloanAmount` from GeneralAdapter1 inside the flashloan
+        // callback, and the swap proceeds are the only funds present when it does. So the
+        // floor the swap is held to must itself cover the reclaim; if it does not, the fill
+        // that the market permits is a fill that cannot repay, and the bundle dies on a bare
+        // "transferFrom reverted" several frames down.
+        //
+        // Each mode reaches this by its own route: a proportional decrease and a full close
+        // get there through the L/(L-1) ratio between collateral withdrawn and debt repaid, a
+        // deleverage through the gross-up in _collateralToCoverRepay. Asserting the shared
+        // property rather than re-deriving trust in each one is what catches the next mode.
+        //
+        // Not a dead end when it fires: `_effectiveMinOut` takes the max of the oracle floor
+        // and the caller's own minOut, so an allocator can always satisfy this by committing
+        // to a minOut that covers the reclaim, rather than gambling on a better-than-floor
+        // fill.
+        require(
+            plan.minSwapOut >= plan.flashloanAmount, SwapFloorCannotRepayFlashloan(plan.minSwapOut, plan.flashloanAmount)
+        );
 
         Call[] memory nested = _buildDecreaseBundle(params, plan, action);
 

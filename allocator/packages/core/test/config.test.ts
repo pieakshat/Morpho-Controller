@@ -118,3 +118,34 @@ describe("deployment artifact schema", () => {
     expect(() => parseDeployment({ ...artifact, markets: { m: "0xdeadbeef" } })).toThrow();
   });
 });
+
+describe("the leverage and slippage coupling", () => {
+  const clone = () =>
+    JSON.parse(JSON.stringify(realConfig)) as { markets: { maxLeverage: string; maxSlippageBps: number }[] };
+
+  /**
+   * Rejected here as well as on-chain because the on-chain rejection happens mid-deploy, after
+   * the vault exists and possibly after other markets have been registered. Failing on the file
+   * costs nothing and fails before anything is broadcast.
+   */
+  it("rejects a market whose positions could be opened and never unwound", () => {
+    const c = clone();
+    c.markets[0]!.maxLeverage = "10000000000000000000"; // 10x
+    c.markets[0]!.maxSlippageBps = 1000; // exactly the boundary: 10 * 1000 = 10000
+
+    expect(() => parseChainConfig(c)).toThrow(/cannot be unwound/);
+  });
+
+  it("accepts the same leverage once the floor is tightened", () => {
+    const c = clone();
+    c.markets[0]!.maxLeverage = "10000000000000000000";
+    c.markets[0]!.maxSlippageBps = 999;
+
+    expect(() => parseChainConfig(c)).not.toThrow();
+  });
+
+  it("accepts the deployed config as it stands", () => {
+    // 5x against 50bps is 2500, a fortieth of the limit.
+    expect(() => parseChainConfig(clone())).not.toThrow();
+  });
+});

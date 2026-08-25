@@ -718,6 +718,49 @@ contract MorphoLeverageVaultForkTest is Test {
         assertLe(equityAfter, equityBefore, "the swept surplus should leave the position");
     }
 
+    /// @dev The invariant the engine now asserts per action, checked across the grid rather
+    ///      than at one configuration.
+    ///
+    ///      Every decrease mode has to leave `minSwapOut >= flashloanAmount`, because Morpho
+    ///      reclaims the flashloan from GeneralAdapter1 while the swap proceeds are the only
+    ///      funds present. Each mode gets there differently: a proportional decrease and a
+    ///      full close through the L/(L-1) ratio between collateral withdrawn and debt repaid,
+    ///      a deleverage through the gross-up in _collateralToCoverRepay. Deleverage failed
+    ///      this for every input before that gross-up existed.
+    function testFuzz_everyDecreaseModeCanRepayItsOwnFlashloan(
+        uint256 openLeverage,
+        uint256 targetLeverage,
+        uint256 slippageBps
+    ) public {
+        slippageBps = bound(slippageBps, 1, 1_000);
+        // Registry coupling: past 10_000e18 / slippageBps the market is unwindable-by-config
+        // and registerMarket refuses it, so there is nothing to exercise above that.
+        uint256 leverageCeiling = (10_000 * 1e18) / slippageBps - 1;
+        if (leverageCeiling > 5e18) leverageCeiling = 5e18;
+        openLeverage = bound(openLeverage, 1.1e18, leverageCeiling);
+
+        // Leverage down before slippage up, or the pair is momentarily illegal and the
+        // registry refuses the first call. Setting the ceiling first is always safe: it can
+        // only shrink the product, and the market starts at the suite's 50bps.
+        vm.startPrank(owner);
+        vault.setMaxLeverage(wstEthMarketId, leverageCeiling);
+        vault.setMaxSlippageBps(wstEthMarketId, slippageBps);
+        vm.stopPrank();
+
+        _openPositionWithLeverage(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6, openLeverage);
+
+        (, uint256 currentLeverage) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+        // Nothing to deleverage into if the open already landed at or below 1x.
+        if (currentLeverage <= 1.001e18) return;
+        targetLeverage = bound(targetLeverage, 1e18, currentLeverage - 1e15);
+
+        // Reverts if the engine's own invariant fails, which is the assertion.
+        _deleveragePosition(wstEthMarketId, wstEthParams, targetLeverage);
+
+        (,, uint128 collateralAfter) = IMorpho(MORPHO).position(wstEthMarketId, address(vault));
+        assertGt(collateralAfter, 0, "deleverage should never fully close the position");
+    }
+
     /*//////////////////////////////////////////////////////////////
                             MULTI-MARKET REBALANCE
     //////////////////////////////////////////////////////////////*/

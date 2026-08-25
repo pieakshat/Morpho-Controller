@@ -196,7 +196,11 @@ contract MorphoMarketRegistryTest is Test {
         address irm,
         uint256 lltv
     ) public {
-        leverage = bound(leverage, 1e18, 1_000e18);
+        // Upper bound is no longer arbitrary: leverage and slippage are coupled, because a
+        // decrease sells collateral worth L/(L-1) times the debt it repays and so can only
+        // afford to lose 1/L on the swap. Anything past 10_000e18 / SLIPPAGE_BPS describes a
+        // market that could be entered and never unwound, and _requireUnwindable rejects it.
+        leverage = bound(leverage, 1e18, (10_000 * 1e18) / SLIPPAGE_BPS - 1);
         lltv = bound(lltv, 0, 1e18);
 
         MarketParams memory params = MarketParams({
@@ -208,6 +212,44 @@ contract MorphoMarketRegistryTest is Test {
 
         assertTrue(vault.isMarketEnabled(id));
         assertEq(vault.marketConfig(id).maxLeverage, leverage);
+    }
+
+    /// @dev The coupling in its own right: neither value is invalid alone, only together.
+    function test_registerMarket_rejectsALeverageAndSlippagePairThatCannotUnwind() public {
+        uint256 justOver = (10_000 * 1e18) / 1_000; // 10x paired with the 1000bps ceiling
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(MorphoMarketRegistry.UnwindableConfigViolated.selector, justOver, uint256(1_000))
+        );
+        vault.registerMarket(_params(address(0xC0FFEE)), justOver, 1_000);
+
+        // One wei of leverage below the boundary is fine, which is what makes this a real
+        // boundary and not a blanket ban on either setting.
+        vm.prank(owner);
+        vault.registerMarket(_params(address(0xC0FFEE)), justOver - 1, 1_000);
+    }
+
+    /// @dev The setters have to hold the line too: either value moving alone can break the
+    ///      pair, and a market registered safely could otherwise be edited into a trap.
+    function test_setters_rejectAPairThatCannotUnwind() public {
+        vm.prank(owner);
+        Id id = vault.registerMarket(_params(address(0xDEFACE)), 5e18, 1_000); // 5 * 1000, fine
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(MorphoMarketRegistry.UnwindableConfigViolated.selector, uint256(10e18), uint256(1_000))
+        );
+        vault.setMaxLeverage(id, 10e18);
+
+        vm.prank(owner);
+        Id id2 = vault.registerMarket(_params(address(0xFEED)), 20e18, 100); // 20 * 100, fine
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(MorphoMarketRegistry.UnwindableConfigViolated.selector, uint256(20e18), uint256(1_000))
+        );
+        vault.setMaxSlippageBps(id2, 1_000);
     }
 
     function testFuzz_registerMarket_revertsForAnyInvalidLeverage(uint256 leverage) public {

@@ -490,8 +490,15 @@ contract AuditTest is Test {
     ///      tolerance as loose as 10%. The per-call totalAssets check is the second layer
     ///      that still catches a loss which slips under a permissive per-swap floor.
     function test_H12_totalAssetsBackstopCatchesLossUnderALooseSwapFloor() public {
-        vm.prank(owner);
+        // The leverage ceiling has to come down before the slippage floor can go up: the two
+        // are coupled, and this market's 10x ceiling paired with 1000bps is exactly the
+        // configuration _requireUnwindable rejects, since a decrease at 10x can only afford to
+        // lose 1/10 on the swap before its proceeds stop covering the repay. 5x leaves the
+        // owner free to set the loosest floor the registry allows, which is what this tests.
+        vm.startPrank(owner);
+        vault.setMaxLeverage(wstEthMarketId, 5e18);
         vault.setMaxSlippageBps(wstEthMarketId, 1_000); // the maximum the owner may set
+        vm.stopPrank();
 
         SkimmingRouter skimmer = new SkimmingRouter(attacker);
         uint256 totalAmount = 200_000e6;

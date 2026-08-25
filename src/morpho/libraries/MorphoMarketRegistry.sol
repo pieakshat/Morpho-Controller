@@ -17,6 +17,10 @@ abstract contract MorphoMarketRegistry {
     error InvalidSlippageBps(uint256 requested, uint256 limit);
     error LoanTokenMismatch(address expected, address actual);
 
+    /// @notice maxLeverage and maxSlippageBps together describe a market whose positions
+    ///         could be opened but never unwound. See _requireUnwindable.
+    error UnwindableConfigViolated(uint256 maxLeverage, uint256 maxSlippageBps);
+
     event MarketRegistered(Id indexed id, uint256 maxLeverage, uint256 maxSlippageBps);
     event MarketEnabledSet(Id indexed id, bool enabled);
     event MarketMaxLeverageUpdated(Id indexed id, uint256 maxLeverage);
@@ -29,6 +33,24 @@ abstract contract MorphoMarketRegistry {
     ///      vault's deployable capital, so it should never be configurable into
     ///      irrelevance, even by mistake.
     uint256 internal constant MAX_SLIPPAGE_BPS_LIMIT = 1_000; // 10%
+
+    /// @dev The two settings are not independent, and pairing a high ceiling with a loose
+    ///      floor produces a market that can be entered and never unwound.
+    ///
+    ///      A decrease withdraws collateral and sells it to repay debt. At leverage L the
+    ///      collateral withdrawn is worth L/(L-1) times the debt it repays, so the swap can
+    ///      afford to lose at most 1/L before the proceeds no longer cover the repayment,
+    ///      and Morpho's reclaim reverts. That is `maxSlippageBps * maxLeverage < 10_000e18`.
+    ///
+    ///      10x with the 1000bps ceiling sits exactly on the boundary, so it is reachable
+    ///      today: maxLeverage has no upper bound of its own. Checked wherever either value
+    ///      is set, since each can move independently. MorphoLeverageEngine enforces the
+    ///      same property per action as a backstop.
+    function _requireUnwindable(uint256 maxLeverage, uint256 maxSlippageBps) private pure {
+        require(
+            maxSlippageBps * maxLeverage < 10_000 * 1e18, UnwindableConfigViolated(maxLeverage, maxSlippageBps)
+        );
+    }
 
     /// @notice The asset this adapter (and its owning vault) is denominated in. Every
     ///         registered market's loanToken must equal this — see _registerMarket.
@@ -67,6 +89,7 @@ abstract contract MorphoMarketRegistry {
         require(params.loanToken == ASSET, LoanTokenMismatch(ASSET, params.loanToken));
         require(maxLeverage >= 1e18, InvalidLeverage());
         require(maxSlippageBps <= MAX_SLIPPAGE_BPS_LIMIT, InvalidSlippageBps(maxSlippageBps, MAX_SLIPPAGE_BPS_LIMIT));
+        _requireUnwindable(maxLeverage, maxSlippageBps);
         id = _computeId(params);
         require(!_isRegistered[id], MarketAlreadyRegistered(id));
 
@@ -90,6 +113,7 @@ abstract contract MorphoMarketRegistry {
     ///         an open position, only what future increases may request.
     function _setMaxLeverage(Id id, uint256 maxLeverage) internal onlyRegistered(id) {
         require(maxLeverage >= 1e18, InvalidLeverage());
+        _requireUnwindable(maxLeverage, _marketConfigs[id].maxSlippageBps);
         _marketConfigs[id].maxLeverage = maxLeverage;
         emit MarketMaxLeverageUpdated(id, maxLeverage);
     }
@@ -97,6 +121,7 @@ abstract contract MorphoMarketRegistry {
     /// @notice Updates how far below the oracle price this market's swaps may fill.
     function _setMaxSlippageBps(Id id, uint256 maxSlippageBps) internal onlyRegistered(id) {
         require(maxSlippageBps <= MAX_SLIPPAGE_BPS_LIMIT, InvalidSlippageBps(maxSlippageBps, MAX_SLIPPAGE_BPS_LIMIT));
+        _requireUnwindable(_marketConfigs[id].maxLeverage, maxSlippageBps);
         _marketConfigs[id].maxSlippageBps = maxSlippageBps;
         emit MarketMaxSlippageUpdated(id, maxSlippageBps);
     }

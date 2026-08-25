@@ -109,6 +109,18 @@ export const chainConfigSchema = z
     message: "every market's loanToken must equal the vault asset",
     path: ["markets"],
   })
+  // maxLeverage and maxSlippageBps are coupled, and the registry rejects the pair on-chain.
+  // A decrease sells collateral worth L/(L-1) times the debt it repays, so the swap can only
+  // afford to lose 1/L before the proceeds stop covering the repayment and Morpho's reclaim
+  // reverts. A market past that describes positions that can be opened and never unwound.
+  .refine(
+    (c) => c.markets.every((m) => BigInt(m.maxSlippageBps) * m.maxLeverage < 10_000n * 10n ** 18n),
+    {
+      message:
+        "maxSlippageBps * maxLeverage must stay below 10000e18, or positions in the market cannot be unwound",
+      path: ["markets"],
+    },
+  )
   // A live cap with a zero window is the footgun RiskLimits.setMaxExposureChangePerWindow
   // rejects on-chain: a zero window makes every call look like a fresh period, turning a
   // per-window budget into a per-action one.
