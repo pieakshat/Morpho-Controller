@@ -1,7 +1,7 @@
 /**
  * Tests the Velora adapter against a payload captured live from api.paraswap.io, using the
  * exact caller topology this system has: userAddress = the swap executor, txOrigin = the
- * allocator EOA, receiver = GeneralAdapter1.
+ * allocator EOA, and receiver = the swap executor as well.
  *
  * Recorded rather than invented, because the two things most likely to be wrong here are
  * assumptions about the response shape. Fetch is injected, so the suite stays offline.
@@ -100,14 +100,23 @@ describe("the parameters that are easy to get wrong", () => {
     expect(captured.txBody?.txOrigin).not.toBe(captured.txBody?.userAddress);
   });
 
-  it("routes output to the recipient, not the caller", async () => {
-    // On a decrease with debt this must be GeneralAdapter1: Morpho reclaims the flashloan
-    // inside the same call, so proceeds arriving anywhere else are too late.
+  it("passes the recipient through as the route's receiver, on both calls", async () => {
+    // Both endpoints have to agree, because /prices is what gets HMAC-signed and echoed back
+    // to /transactions; a receiver set on only one of them prices a different route than it
+    // builds.
     const { captured, provider } = replay();
     await provider.quote(REQUEST);
 
     expect(captured.txBody?.receiver).toBe(REQUEST.recipient);
     expect(captured.priceUrl?.searchParams.get("receiver")).toBe(REQUEST.recipient);
+  });
+
+  it("quotes the swap executor as its own receiver", async () => {
+    // The topology the engine actually produces, and the fixture records. `executeSwap`
+    // enforces minOut against its OWN balance delta and only then forwards to
+    // GeneralAdapter1, so a route paying GeneralAdapter1 directly leaves that delta at zero
+    // and the bundle reverts SlippageExceeded(0, minOut) with the output already gone.
+    expect(REQUEST.recipient).toBe(REQUEST.caller);
   });
 
   it("sets ignoreChecks, since the executor holds nothing at quote time", async () => {

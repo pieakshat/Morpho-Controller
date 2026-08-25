@@ -20,21 +20,20 @@ import {MorphoSharesMath} from "../../src/morpho/libraries/MorphoSharesMath.sol"
 ///      replaying it 3.5M blocks earlier would fail on pool balances that had not happened
 ///      yet. The payload and the block have to travel together.
 ///
-///      Regenerate both by re-running the capture that produced
-///      allocator/packages/planner/test/fixtures/velora-arbitrum.json and updating
-///      QUOTE_BLOCK to the priceRoute's own blockNumber.
+///      Regenerate both by running the planner package's `capture:velora` script, then set
+///      QUOTE_BLOCK to the priceRoute's own blockNumber, which the script prints.
 contract VeloraRouteForkTest is Test {
     address constant USDC = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831;
     address constant WSTETH = 0x5979D7b546E38E414F7E9822514be443A4800529;
     address constant WSTETH_ORACLE = 0x8e02a9b9Cc29d783b2fCB71C3a72651B591cae31;
 
     /// @dev The `blockNumber` inside the recorded priceRoute.
-    uint256 constant QUOTE_BLOCK = 494_800_425;
+    uint256 constant QUOTE_BLOCK = 498_219_507;
 
     string fixture;
 
     address caller; // the vault's swap executor, as userAddress in the quote
-    address receiver; // GeneralAdapter1, as receiver in the quote
+    address receiver; // also the swap executor: see the note on the delivery test below
     address router; // Augustus v6.2
     uint256 amountIn;
     uint256 expectedOut;
@@ -77,23 +76,21 @@ contract VeloraRouteForkTest is Test {
 
         uint256 delivered = IERC20(WSTETH).balanceOf(receiver) - receiverBefore;
 
-        // Delivered to the receiver named in the quote, not to the caller: the property under
-        // test is that Velora honours an arbitrary receiver at all, since the executor is
-        // never the transaction sender.
+        // The output must land on the EXECUTOR, and this is the property the whole bundle
+        // depends on rather than a detail of the fixture.
         //
-        // NOTE the receiver this fixture names is GeneralAdapter1, which is NOT what a
-        // production route should ask for. MorphoSwapExecutor enforces minOut against its OWN
-        // balance delta and only then forwards to GeneralAdapter1, so a route paying
-        // GeneralAdapter1 directly leaves that delta at zero and the bundle dies on
-        // SlippageExceeded(0, minOut) with the tokens already delivered somewhere the check
-        // cannot see them. The allocator therefore quotes with the executor as receiver; see
-        // the recipient note in allocator/packages/planner/src/quote.ts. Regenerating this
-        // fixture is the moment to align it.
-        assertGt(delivered, 0, "receiver got nothing");
+        // MorphoSwapExecutor measures its own balance delta to enforce minOut, and only then
+        // forwards to GeneralAdapter1. A route paying GeneralAdapter1 directly leaves that
+        // delta at zero, so the bundle reverts SlippageExceeded(0, minOut) with the tokens
+        // already delivered somewhere the check cannot see them. An earlier version of this
+        // fixture named GeneralAdapter1 as receiver and so recorded a topology the vault
+        // rejects; see the recipient note in allocator/packages/planner/src/quote.ts.
+        assertEq(receiver, caller, "fixture must quote the executor as its own receiver");
+        assertGt(delivered, 0, "executor received nothing, so minOut would be enforced against zero");
         assertEq(
-            IERC20(WSTETH).balanceOf(caller),
-            callerCollateralBefore,
-            "output went to the caller instead of the receiver"
+            IERC20(WSTETH).balanceOf(caller) - callerCollateralBefore,
+            delivered,
+            "the executor's own balance must be what moved"
         );
 
         // And the input really was consumed.
@@ -143,12 +140,18 @@ contract VeloraRouteForkTest is Test {
         uint256 price = IOracle(WSTETH_ORACLE).price();
         uint256 oracleImplied = MorphoSharesMath.mulDivDown(amountIn, MorphoSharesMath.ORACLE_PRICE_SCALE, price);
 
-        assertLt(expectedOut, oracleImplied, "route should be worse than the oracle, not better");
-        uint256 shortfallBps = ((oracleImplied - expectedOut) * 10_000) / oracleImplied;
-
-        // 50 is what script/config/42161.json registers for this market. Price impact adds
-        // roughly 14bps more by 500k, so the headroom below is what absorbs size.
+        // 50 is what script/config/42161.json registers for this market, and the floor the
+        // engine will raise any submitted minOut to.
         uint256 configuredBps = 50;
+
+        // The route being BETTER than the oracle is normal and clears trivially. An earlier
+        // version of this test asserted the opposite and was simply wrong: measured across
+        // sizes on Arbitrum, an honest USDC -> wstETH fill runs anywhere from a couple of bps
+        // above the oracle to a couple below, because the oracle is a reference price and not
+        // a quote. Only a shortfall can breach the floor.
+        if (expectedOut >= oracleImplied) return;
+
+        uint256 shortfallBps = ((oracleImplied - expectedOut) * 10_000) / oracleImplied;
         assertLt(shortfallBps, configuredBps, "real spread has outgrown the configured maxSlippageBps");
     }
 }
