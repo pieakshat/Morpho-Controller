@@ -12,9 +12,16 @@ const WAD = 10n ** 18n;
 /**
  * Mirrors `MorphoLeverageEngine._planDeleverage`.
  *
- * The shape to understand: equity is held constant and the collateral value is rebased to
- * `targetLeverage * equity`, so the value withdrawn equals the value repaid and no capital
- * enters or leaves beyond that.
+ * The shape to understand: the withdrawal is grossed up by the market's slippage tolerance so
+ * the swap can always repay the flashloan, and the target debt is then SOLVED for so the
+ * position still lands on `targetLeverage` once that surplus has left it.
+ *
+ * Both halves are load-bearing. Sizing the withdrawal to the repay's own oracle value is the
+ * obvious thing and cannot work: the flashloan is taken by GeneralAdapter1 and Morpho reclaims
+ * from GeneralAdapter1 inside the callback, so the swap proceeds are the only funds present,
+ * and a real route always fills below the oracle. And once the withdrawal is grossed up, the
+ * naive `equity * (target - 1)` target debt leaves the position ABOVE the request, by 0.7% at
+ * this market's 50bps and 21% at the registry's 1000bps ceiling.
  *
  * The repay is derived in SHARES, not value, and that is not a stylistic choice. Computing an
  * asset amount from an independently-rounded value estimate can convert back to more shares
@@ -60,15 +67,13 @@ export function planDeleverage(
     fail({ code: "TargetLeverageNotBelowCurrent", target, current: currentLeverage });
   }
 
-  const newCollateralValue = (target * equity) / WAD;
-
   let repayShares: bigint;
   if (target === WAD) {
     // 1x means no debt at all. Repaying the exact share count avoids the rounding dust a
     // value-derived amount would leave.
     repayShares = borrowShares;
   } else {
-    const newDebtValue = newCollateralValue - equity;
+    const newDebtValue = targetDebtValue(target, equity, debtValue, m.maxSlippageBps);
     let targetBorrowShares = toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
     // The up/down rounding chain can overshoot by a share or two at the margins. Clamp
     // rather than let the subtraction below underflow.
@@ -81,7 +86,13 @@ export function planDeleverage(
   // Both derived from repayShares rather than from a separately-rounded value estimate, so
   // the flashloan is always exactly enough to cover what Morpho charges for this many shares.
   const flashloanAmount = toAssetsUp(repayShares, totalBorrowAssets, totalBorrowShares);
-  const collateralToWithdraw = mulDivUp(flashloanAmount, ORACLE_PRICE_SCALE, price);
+  // Mirrors `_collateralToCoverRepay`: sell enough that even the worst fill this market
+  // permits still repays the flashloan.
+  const collateralToWithdraw = mulDivUp(
+    mulDivUp(flashloanAmount, 10_000n, 10_000n - m.maxSlippageBps),
+    ORACLE_PRICE_SCALE,
+    price,
+  );
 
   if (collateralToWithdraw > collateral) {
     fail({ code: "InvalidDecreaseAmount", requested: collateralToWithdraw, available: collateral });
@@ -112,4 +123,29 @@ export function planDeleverage(
       minOutFloor: oracleFloor(oracleExpectedOut, m.maxSlippageBps),
     },
   };
+}
+
+/**
+ * Mirrors `MorphoLeverageEngine._targetDebtValue`.
+ *
+ * Writing D for debt, E for equity, k for `target - 1e18` and m for the slippage fraction
+ * `s / (10_000 - s)`, the post-state has to satisfy `D_f = k * (E - (D - D_f) * m)`, because
+ * the surplus `(D - D_f) * m` is what the grossed-up withdrawal sends to idle. Solving gives
+ * `D_f = k * (E - D*m) / (1 - k*m)`, multiplied through by `10_000 - s` to stay in integers.
+ */
+function targetDebtValue(target: bigint, equity: bigint, debtValue: bigint, maxSlippageBps: bigint): bigint {
+  // Nothing is grossed up when no slippage is tolerated, so the naive target is already exact.
+  if (maxSlippageBps === 0n) return ((target - WAD) * equity) / WAD;
+
+  const denom = 10_000n - maxSlippageBps;
+  const k = target - WAD;
+
+  // Both say the same thing from different directions: the slippage this market permits has to
+  // be affordable out of the equity being worked with. Only reachable for a market pairing very
+  // high leverage with a very loose bound, which the contract rejects as DeleverageTooCostly.
+  if (equity * denom <= debtValue * maxSlippageBps || WAD * denom <= k * maxSlippageBps) {
+    fail({ code: "DeleverageTooCostly" });
+  }
+
+  return (k * (equity * denom - debtValue * maxSlippageBps)) / (WAD * denom - k * maxSlippageBps);
 }

@@ -237,6 +237,39 @@ contract MorphoLeverageVaultForkTest is Test {
     ///      computing the repay in Morpho's own share unit (not a separately-rounded value
     ///      estimate) is what keeps it safely bounded by what's actually outstanding, so
     ///      this mirrors that precisely rather than approximating it.
+    /// @dev Mirrors MorphoLeverageEngine._targetDebtValue. The withdrawal is grossed up by the
+    ///      market's slippage tolerance, and that surplus leaves the position for idle, so the
+    ///      target debt has to be solved for rather than taken as `equity * (L - 1)`.
+    ///
+    ///      Separate function for the same reason the engine's is: _planDeleverage's frame is
+    ///      already at the stack limit.
+    function _mirrorTargetDebtValue(Id id, uint256 targetLeverage, uint256 equity, uint256 debtValue)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 s = vault.marketConfig(id).maxSlippageBps;
+        if (s == 0) return ((targetLeverage - 1e18) * equity) / 1e18;
+
+        uint256 denom = 10_000 - s;
+        uint256 k = targetLeverage - 1e18;
+        return (k * (equity * denom - debtValue * s)) / (uint256(1e18) * denom - k * s);
+    }
+
+    /// @dev Mirrors MorphoLeverageEngine._collateralToCoverRepay: sell enough that even the
+    ///      worst fill this market permits still repays the flashloan.
+    function _mirrorCollateralToCoverRepay(Id id, uint256 repayAmount, uint256 price)
+        internal
+        view
+        returns (uint256)
+    {
+        return MorphoSharesMath.mulDivUp(
+            MorphoSharesMath.mulDivUp(repayAmount, 10_000, 10_000 - vault.marketConfig(id).maxSlippageBps),
+            MorphoSharesMath.ORACLE_PRICE_SCALE,
+            price
+        );
+    }
+
     function _planDeleverage(Id id, MarketParams memory params, uint256 targetLeverage)
         internal
         returns (uint256 collateralToWithdraw, uint256 repayAmount)
@@ -246,27 +279,31 @@ contract MorphoLeverageVaultForkTest is Test {
         (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = IMorpho(MORPHO).market(id);
 
         uint256 price = IOracle(params.oracle).price();
-        uint256 collateralValue = MorphoSharesMath.mulDivDown(collateralRaw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
         uint256 debtValue = borrowSharesRaw > 0
             ? MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares)
             : 0;
 
-        uint256 equity = collateralValue - debtValue;
-        uint256 newCollateralValue = (targetLeverage * equity) / 1e18;
+        // Scoped so collateralValue gives its stack slot back, matching the engine.
+        uint256 equity;
+        {
+            uint256 collateralValue =
+                MorphoSharesMath.mulDivDown(collateralRaw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+            equity = collateralValue - debtValue;
+        }
 
         uint256 repayShares;
         if (targetLeverage == 1e18) {
             repayShares = borrowSharesRaw;
         } else {
-            uint256 newDebtValue = newCollateralValue - equity;
-            uint256 targetBorrowShares =
-                MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
+            uint256 targetBorrowShares = MorphoSharesMath.toSharesDown(
+                _mirrorTargetDebtValue(id, targetLeverage, equity, debtValue), totalBorrowAssets, totalBorrowShares
+            );
             if (targetBorrowShares > borrowSharesRaw) targetBorrowShares = borrowSharesRaw;
             repayShares = borrowSharesRaw - targetBorrowShares;
         }
 
         repayAmount = MorphoSharesMath.toAssetsUp(repayShares, totalBorrowAssets, totalBorrowShares);
-        collateralToWithdraw = MorphoSharesMath.mulDivUp(repayAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price);
+        collateralToWithdraw = _mirrorCollateralToCoverRepay(id, repayAmount, price);
     }
 
     /// @dev Shared live-state reader for the deleverage assertions below — pulled out
@@ -286,10 +323,16 @@ contract MorphoLeverageVaultForkTest is Test {
     function _deleveragePosition(Id id, MarketParams memory params, uint256 targetLeverage) internal {
         (uint256 collateralToWithdraw, uint256 repayAmount) = _planDeleverage(id, params, targetLeverage);
 
-        // Rate rounded up so collateralToWithdraw*rate/1e18 is guaranteed >= repayAmount —
-        // _buildDecreaseSwap's own price-based rate rounds independently of this plan's
-        // own math and can leave the flashloan a couple wei short.
-        uint256 rate = MorphoSharesMath.mulDivUp(repayAmount, 1e18, collateralToWithdraw);
+        // Fill at the ORACLE rate, which is what an honest route approximates.
+        //
+        // It used to fill at repayAmount/collateralToWithdraw. That was the same thing back
+        // when the withdrawal was sized to the repay's own oracle value, but the engine now
+        // grosses it up by maxSlippageBps, so that rate is precisely the worst fill the market
+        // permits: it delivers exactly the flashloan and leaves nothing to sweep, which reads
+        // as the vault losing the whole slippage allowance on every deleverage. Filling at the
+        // oracle exercises the path that actually matters, where the surplus over the reclaim
+        // is swept back to idle.
+        uint256 rate = (IOracle(params.oracle).price() + 1e18 - 1) / 1e18;
         uint256 expectedOut = (collateralToWithdraw * rate) / 1e18;
         router.setRate(rate);
         deal(USDC, address(router), expectedOut);
@@ -533,6 +576,7 @@ contract MorphoLeverageVaultForkTest is Test {
         (, uint128 borrowSharesBefore, uint128 collateralBefore) =
             IMorpho(MORPHO).position(wstEthMarketId, address(vault));
         (uint256 equityBefore,) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+        uint256 vaultAssetsBefore = vault.totalAssets();
 
         uint256 adapterUsdcBefore = IERC20(USDC).balanceOf(GENERAL_ADAPTER);
         uint256 adapterCollateralBefore = IERC20(WSTETH).balanceOf(GENERAL_ADAPTER);
@@ -547,11 +591,22 @@ contract MorphoLeverageVaultForkTest is Test {
 
         (uint256 equityAfter, uint256 realizedLeverage) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
 
-        // Rounding in collateralToWithdraw always rounds up (withdraws slightly more than
-        // the bare minimum), so realized leverage should land at or just under the target.
-        assertLe(realizedLeverage, 1.5e18, "should never overshoot past the target leverage");
+        // The engine grosses the withdrawal up by maxSlippageBps so the swap can always repay
+        // the flashloan, and solves for the debt that leaves the position on target once that
+        // surplus has left. Landing at or just under the request is the property; before the
+        // solve existed this overshot by 0.7% here and by 21% at the registry's bps ceiling.
+        assertLeDecimal(realizedLeverage, 1.5e18 + 1e12, 18, "should never overshoot past the target leverage");
         assertApproxEqAbs(realizedLeverage, 1.5e18, 0.001e18, "realized leverage should land close to target");
-        assertApproxEqRel(equityAfter, equityBefore, 0.001e18, "equity should stay roughly constant, self-funded");
+        // Self-funding is a VAULT-level property, not a position-level one.
+        //
+        // The engine withdraws more collateral than the repay is worth, by exactly the
+        // slippage the market tolerates, so the swap can always cover the flashloan. The
+        // surplus over the reclaim is swept out of GeneralAdapter1 into the vault, which means
+        // position equity genuinely falls by that surplus while the vault as a whole keeps it.
+        // Asserting on position equity here would be asserting the surplus never left, which
+        // is the opposite of what should happen.
+        assertApproxEqRel(vault.totalAssets(), vaultAssetsBefore, 0.001e18, "deleverage should be self-funded");
+        assertLt(equityAfter, equityBefore, "the swept surplus should leave the position");
 
         assertEq(IERC20(USDC).balanceOf(GENERAL_ADAPTER), adapterUsdcBefore, "GeneralAdapter1 USDC dust");
         assertEq(IERC20(WSTETH).balanceOf(GENERAL_ADAPTER), adapterCollateralBefore, "GeneralAdapter1 collateral dust");
@@ -633,6 +688,7 @@ contract MorphoLeverageVaultForkTest is Test {
 
         _openPositionWithLeverage(wstEthMarketId, wstEthParams, WSTETH_ORACLE, 100_000e6, startLeverage);
         (uint256 equityBefore,) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
+        uint256 vaultAssetsBefore = vault.totalAssets();
 
         _deleveragePosition(wstEthMarketId, wstEthParams, targetLeverage);
 
@@ -651,9 +707,15 @@ contract MorphoLeverageVaultForkTest is Test {
 
         (uint256 equityAfter, uint256 realizedLeverage) = _readEquityAndLeverage(wstEthMarketId, WSTETH_ORACLE);
         if (targetLeverage > 1e18) {
-            assertLe(realizedLeverage, targetLeverage, "should never overshoot past the target leverage");
+            assertLeDecimal(
+                realizedLeverage, targetLeverage + 1e12, 18, "should never overshoot past the target leverage"
+            );
         }
-        assertApproxEqRel(equityAfter, equityBefore, 0.001e18, "equity should stay roughly constant, self-funded");
+        // Vault-level, not position-level: the gross-up's surplus is swept out of the position
+        // into idle, so position equity is expected to fall by it. See the note in
+        // test_decreasePosition_deleveragesToTargetRatio.
+        assertApproxEqRel(vault.totalAssets(), vaultAssetsBefore, 0.001e18, "deleverage should be self-funded");
+        assertLe(equityAfter, equityBefore, "the swept surplus should leave the position");
     }
 
     /*//////////////////////////////////////////////////////////////

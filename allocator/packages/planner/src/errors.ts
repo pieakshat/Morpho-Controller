@@ -32,6 +32,7 @@ export type PlannerFailure =
   | { code: "InvalidDecreaseAmount"; requested: bigint; available: bigint }
   | { code: "DecreaseAmountTooSmall" }
   | { code: "DeleverageAmountTooSmall" }
+  | { code: "DeleverageTooCostly" }
   | { code: "PositionHasNoEquity"; marketId: Id }
   | { code: "TargetLeverageNotBelowCurrent"; target: bigint; current: bigint }
 
@@ -86,6 +87,8 @@ export function describeFailure(f: PlannerFailure): string {
       return `${f.code}: the repay this implies rounds to zero, which would withdraw collateral for free`;
     case "DeleverageAmountTooSmall":
       return `${f.code}: the target implies repaying zero shares`;
+    case "DeleverageTooCostly":
+      return `${f.code}: this market's slippage allowance exceeds what the position's equity can absorb`;
     case "PositionHasNoEquity":
       return `${f.code}: ${f.marketId} has no equity, so leverage is undefined`;
     case "TargetLeverageNotBelowCurrent":

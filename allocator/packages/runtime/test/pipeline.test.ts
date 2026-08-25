@@ -120,29 +120,39 @@ const DELEVERAGE = {
 
 describe("deleverage", () => {
   /**
-   * This documents a CONTRACT bug, not a planner one, and the refusal here is correct.
+   * This mode was unexecutable until the engine was fixed, and the reason is worth keeping.
    *
-   * `_planDeleverage` sets `collateralToWithdraw = mulDivUp(flashloanAmount, 1e36, price)`, so
-   * the collateral being sold is worth exactly what the flashloan reclaims AT THE ORACLE. Every
-   * real route fills below the oracle, so the swap output is always short by the spread.
+   * `_planDeleverage` used to set `collateralToWithdraw` to the flashloan's own oracle value,
+   * so the collateral sold was worth the debt only AT THE ORACLE. Every real route fills below
+   * the oracle, and nothing could make up the difference: the flashloan is taken by
+   * GeneralAdapter1 and Morpho reclaims from GeneralAdapter1 synchronously inside the callback,
+   * while the sweep of the vault's own balance runs after the flashloan returns. Confirmed on
+   * an Arbitrum fork, where seeding GeneralAdapter1 with 1,000 USDC was enough to make an
+   * otherwise identical deleverage go through.
    *
-   * There is nothing to make up the difference. `morphoFlashLoan` is taken by GeneralAdapter1
-   * and Morpho reclaims from GeneralAdapter1 synchronously inside the callback, while the only
-   * sweep of the vault's own balance runs AFTER the flashloan returns. The vault's idle is
-   * therefore unreachable at the moment it would be needed.
-   *
-   * Confirmed on an Arbitrum fork: seeding GeneralAdapter1 with 1,000 USDC made an otherwise
-   * identical deleverage simulate cleanly, and without it the bundle died on Morpho's own
-   * "transferFrom reverted". Until the engine grosses the withdrawal up, refusing locally is
-   * strictly better than paying gas to learn the same thing.
+   * The engine now grosses the withdrawal up by the market's slippage tolerance and solves for
+   * the debt that still lands the position on target once the surplus has left it.
    */
-  it("refuses a deleverage the contract cannot execute", async () => {
+  it("plans, encodes and simulates a 2x -> 1.5x deleverage", async () => {
     const result = await runOnce(deps(makeWorld()), [DELEVERAGE]);
+    if (result.outcome === "rejected") throw new Error(`${result.stage}: ${result.reason}`);
+    expect(result.outcome).toBe("simulated");
+  });
 
-    expect(result.outcome).toBe("rejected");
-    if (result.outcome !== "rejected") return;
-    expect(result.stage).toBe("encode");
-    expect(result.reason).toMatch(/QuoteCannotCoverFlashloan/);
+  it("sells more collateral than the repay is worth, by the slippage allowance", async () => {
+    const result = await runOnce(deps(makeWorld()), [DELEVERAGE]);
+    if (result.outcome !== "simulated") throw new Error(`unexpected ${result.outcome}`);
+
+    const plan = result.batch.plans[0]!;
+    if (plan.kind === "increase") throw new Error("expected a decrease plan");
+
+    // Worth strictly more than the reclaim at the oracle, which is the whole point: at the
+    // worst fill this market permits the swap still repays.
+    const soldAtOracle = plan.swap.oracleExpectedOut;
+    expect(soldAtOracle).toBeGreaterThan(plan.flashloanAmount);
+
+    // And the floor the contract will enforce is itself at or above the reclaim.
+    expect(plan.swap.minOutFloor).toBeGreaterThanOrEqual(plan.flashloanAmount);
   });
 });
 

@@ -23,6 +23,10 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
     error InvalidDecreaseAmount(uint256 requested, uint256 available);
     error TargetLeverageNotBelowCurrent(uint256 target, uint256 current);
     error DeleverageAmountTooSmall();
+    /// @notice The slippage this market tolerates costs more than the position's equity can
+    ///         absorb, so no repay lands it on the requested ratio. Only reachable for a
+    ///         config pairing very high leverage with a very loose slippage bound.
+    error DeleverageTooCostly();
     error DecreaseAmountTooSmall();
     error NoPosition(Id id);
     error PositionHasNoEquity(Id id);
@@ -358,22 +362,26 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = MORPHO.market(id);
 
         uint256 price = IOracle(params.oracle).price();
-        uint256 collateralValue = MorphoSharesMath.mulDivDown(collateralRaw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
         uint256 debtValue = borrowSharesRaw > 0
             ? MorphoSharesMath.toAssetsUp(borrowSharesRaw, totalBorrowAssets, totalBorrowShares)
             : 0;
 
-        // Underflows and reverts if collateral no longer covers debt. This engine's own
-        // opens should never produce that state, but a silent floor here would hide it
-        // instead of surfacing it as the bug it would be.
-        uint256 equity = collateralValue - debtValue;
-        // Zero equity means there is no ratio to target: leverage is undefined, and the
-        // division below would panic. Say so rather than surfacing a bare arithmetic error.
-        require(equity > 0, PositionHasNoEquity(id));
-        uint256 currentLeverage = (collateralValue * 1e18) / equity;
-        require(targetLeverage < currentLeverage, TargetLeverageNotBelowCurrent(targetLeverage, currentLeverage));
-
-        uint256 newCollateralValue = (targetLeverage * equity) / 1e18;
+        // Scoped so collateralValue and currentLeverage give their stack slots back: this
+        // frame is at the limit, and _targetDebtValue below needs room for its arguments.
+        uint256 equity;
+        {
+            uint256 collateralValue =
+                MorphoSharesMath.mulDivDown(collateralRaw, price, MorphoSharesMath.ORACLE_PRICE_SCALE);
+            // Underflows and reverts if collateral no longer covers debt. This engine's own
+            // opens should never produce that state, but a silent floor here would hide it
+            // instead of surfacing it as the bug it would be.
+            equity = collateralValue - debtValue;
+            // Zero equity means there is no ratio to target: leverage is undefined, and the
+            // division below would panic. Say so rather than surfacing a bare arithmetic error.
+            require(equity > 0, PositionHasNoEquity(id));
+            uint256 currentLeverage = (collateralValue * 1e18) / equity;
+            require(targetLeverage < currentLeverage, TargetLeverageNotBelowCurrent(targetLeverage, currentLeverage));
+        }
 
         // Computed in shares, not value: repaying an asset amount derived independently
         // from a value estimate can convert back to more shares than the position actually
@@ -385,9 +393,9 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         if (targetLeverage == 1e18) {
             repayShares = borrowSharesRaw;
         } else {
-            uint256 newDebtValue = newCollateralValue - equity;
-            uint256 targetBorrowShares =
-                MorphoSharesMath.toSharesDown(newDebtValue, totalBorrowAssets, totalBorrowShares);
+            uint256 targetBorrowShares = MorphoSharesMath.toSharesDown(
+                _targetDebtValue(id, targetLeverage, equity, debtValue), totalBorrowAssets, totalBorrowShares
+            );
             // The up/down rounding chain can still overshoot by a share or two at the
             // margins — clamp rather than let the subtraction below underflow.
             if (targetBorrowShares > borrowSharesRaw) targetBorrowShares = borrowSharesRaw;
@@ -401,10 +409,88 @@ abstract contract MorphoLeverageEngine is MorphoCore, MorphoMarketRegistry {
         // shares — no cross-computation mismatch possible.
         plan.repayShares = repayShares;
         plan.flashloanAmount = MorphoSharesMath.toAssetsUp(repayShares, totalBorrowAssets, totalBorrowShares);
-        plan.collateralToWithdraw =
-            MorphoSharesMath.mulDivUp(plan.flashloanAmount, MorphoSharesMath.ORACLE_PRICE_SCALE, price);
+
+        plan.collateralToWithdraw = _collateralToCoverRepay(id, plan.flashloanAmount, price);
         require(
             plan.collateralToWithdraw <= collateralRaw, InvalidDecreaseAmount(plan.collateralToWithdraw, collateralRaw)
+        );
+    }
+
+    /// @dev Debt the position should be left holding to land on `targetLeverage` AFTER the
+    ///      grossed-up withdrawal has taken its slippage allowance out of equity.
+    ///
+    ///      Solving for this rather than using the naive `equity * (target - 1e18) / 1e18` is
+    ///      what keeps the operation on target. `_collateralToCoverRepay` withdraws more
+    ///      collateral than the repay is worth, and the surplus leaves the position for idle,
+    ///      so equity shrinks by that surplus and the realized ratio lands ABOVE the request.
+    ///      Not by a rounding amount either: the miss is
+    ///      `(current - target) * (target - 1e18) * s / (10_000 - s)`, which is 0.7% of the
+    ///      target at this market's 50bps and 21% at the registry's 1000bps ceiling. A
+    ///      deleverage that undershoots its own risk reduction by a fifth is not a deleverage.
+    ///
+    ///      Writing D for debt, E for equity, k for `target - 1e18` and m for the slippage
+    ///      fraction `s / (10_000 - s)`, the post-state must satisfy
+    ///      `D_f = k * (E - (D - D_f) * m)`, whose solution is
+    ///      `D_f = k * (E - D*m) / (1 - k*m)`. Both sides are multiplied through by
+    ///      `10_000 - s` below to keep it in integers.
+    ///
+    ///      Separate function to keep these locals off _planDeleverage's frame, which is one
+    ///      variable away from stack-too-deep.
+    function _targetDebtValue(Id id, uint256 targetLeverage, uint256 equity, uint256 debtValue)
+        private
+        view
+        returns (uint256)
+    {
+        uint256 s = _marketConfigs[id].maxSlippageBps;
+        // Nothing is grossed up when no slippage is tolerated, so the naive target is exact.
+        if (s == 0) return ((targetLeverage - 1e18) * equity) / 1e18;
+
+        uint256 denom = 10_000 - s;
+        uint256 k = targetLeverage - 1e18;
+
+        // Both conditions say the same thing from different directions: the slippage this
+        // market permits has to be affordable out of the equity being worked with. They can
+        // only fail for a market pairing very high leverage with a very loose bound, and a
+        // named revert beats the bare underflow panic the arithmetic would otherwise produce.
+        require(equity * denom > debtValue * s, DeleverageTooCostly());
+        require(uint256(1e18) * denom > k * s, DeleverageTooCostly());
+
+        return (k * (equity * denom - debtValue * s)) / (uint256(1e18) * denom - k * s);
+    }
+
+    /// @dev Collateral to sell so the swap can still repay `flashloanAmount` at the WORST fill
+    ///      this market permits.
+    ///
+    ///      Sizing the withdrawal to the flashloan's own oracle value is the obvious thing and
+    ///      it cannot work. The collateral sold would be worth the debt only at the oracle,
+    ///      every real route fills below the oracle, and the shortfall has nowhere to come
+    ///      from: the flashloan is taken by GeneralAdapter1 and Morpho reclaims from
+    ///      GeneralAdapter1 synchronously inside the callback, while the sweep of this
+    ///      contract's own balance runs only after the flashloan returns. The swap proceeds
+    ///      are the only funds in the room, and they were short by the spread every time.
+    ///
+    ///      Grossing up by maxSlippageBps makes the guarantee structural rather than hopeful.
+    ///      `minSwapOut` is `unwoundValue * (10_000 - maxSlippageBps) / 10_000`, so inflating
+    ///      unwoundValue by the reciprocal leaves that floor at or above `flashloanAmount`.
+    ///      Both roundings are up, which keeps it true at the wei level rather than
+    ///      approximately. maxSlippageBps is capped at MAX_SLIPPAGE_BPS_LIMIT well below
+    ///      10_000, so the denominator cannot reach zero.
+    ///
+    ///      Whatever the swap returns beyond the reclaim is not stranded: GeneralAdapter1 is
+    ///      swept into this contract by the trailing Call in _decreasePositionCore, so the
+    ///      excess lands in idle.
+    ///
+    ///      Separate function purely to keep it off _planDeleverage's stack frame, which is
+    ///      one local away from stack-too-deep.
+    function _collateralToCoverRepay(Id id, uint256 flashloanAmount, uint256 price)
+        private
+        view
+        returns (uint256)
+    {
+        return MorphoSharesMath.mulDivUp(
+            MorphoSharesMath.mulDivUp(flashloanAmount, 10_000, 10_000 - _marketConfigs[id].maxSlippageBps),
+            MorphoSharesMath.ORACLE_PRICE_SCALE,
+            price
         );
     }
 
