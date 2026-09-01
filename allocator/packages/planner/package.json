@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@morphoagg/core": "workspace:*",
-    "viem": "^2.21.55"
+    "viem": "^2.56.0"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
