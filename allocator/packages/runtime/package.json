@@ -28,7 +28,7 @@
     "@morphoagg/core": "workspace:*",
     "@morphoagg/planner": "workspace:*",
     "viem": "^2.21.55",
-    "zod": "^3.24.1"
+    "zod": "^4.5.2"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
